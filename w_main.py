@@ -356,8 +356,8 @@ async def settlement_loop(executor: PolyExecutor, tg: TelegramAlerts, quality_mo
                     if whale_name:
                         entity_key = f"{whale_name.lower()}_{pos.direction.lower()}"
                         quality_model.record(entity_key, won)
-                    asset_sym = pos.symbol.split("-")[0]
-                    bias_tracker.record(asset_sym, pos.direction, won)
+                        asset_sym = pos.symbol.split("-")[0]
+                        bias_tracker.record(asset_sym, pos.direction, won)
                     pnl     = pos.realized_pnl or 0.0
                     icon    = "✅" if won else "❌"
                     outcome = "WON" if won else "LOST"
