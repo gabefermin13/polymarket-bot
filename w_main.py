@@ -72,6 +72,7 @@ from telegram_alerts import TelegramAlerts
 from ccc_engine      import CCCEngine
 from threshold_engine import ThresholdEngine
 from quality_model   import QualityModel
+from bias_tracker    import BiasTracker
 from choppiness_gate import ChoppinessGate
 import polymarket_data
 
@@ -167,6 +168,7 @@ async def on_whale_trade(
     http_client:      httpx.AsyncClient,
     quality_model:    QualityModel,
     chop_gate:        ChoppinessGate,
+    bias_tracker:     BiasTracker,
 ):
     # 1. Record event in activity window
     ccc_conf = WHALE_CONFIDENCE.get(signal.whale_addr, 0.0)
@@ -253,6 +255,15 @@ async def on_whale_trade(
         _log_signal({**sig_rec, "skip_reason": "choppy_market"})
         return
 
+    # Bias gate (per asset+direction combo)
+    if bias_tracker.is_paused(asset, signal.direction):
+        logger.info(
+            f"[{BOT_LABEL}] {asset} {signal.direction} — "
+            f"bias suppressed, skip"
+        )
+        _log_signal({**sig_rec, "skip_reason": "bias_suppressed"})
+        return
+
     # Quality gate (per entity)
     entity_key = f"{signal.whale_name.lower()}_{signal.direction.lower()}"
     kelly_mult = quality_model.get_multiplier(entity_key)
@@ -322,7 +333,8 @@ async def on_whale_trade(
 
 # ── Loops ─────────────────────────────────────────────────────────────────────
 
-async def settlement_loop(executor: PolyExecutor, tg: TelegramAlerts, quality_model: QualityModel):
+async def settlement_loop(executor: PolyExecutor, tg: TelegramAlerts, quality_model: QualityModel,
+                          bias_tracker: BiasTracker):
     while not _shutdown.is_set():
         try:
             open_before = {p.id for p in executor.open_positions()}
@@ -344,6 +356,8 @@ async def settlement_loop(executor: PolyExecutor, tg: TelegramAlerts, quality_mo
                     if whale_name:
                         entity_key = f"{whale_name.lower()}_{pos.direction.lower()}"
                         quality_model.record(entity_key, won)
+                    asset_sym = pos.symbol.split("-")[0]
+                    bias_tracker.record(asset_sym, pos.direction, won)
                     pnl     = pos.realized_pnl or 0.0
                     icon    = "✅" if won else "❌"
                     outcome = "WON" if won else "LOST"
@@ -526,7 +540,9 @@ async def main():
             else None
         )
     )
-    chop_gate = ChoppinessGate()
+    chop_gate    = ChoppinessGate()
+    bias_tracker = BiasTracker()
+    bias_tracker.warmup(f"{LOGS_DIR}/positions.jsonl")
     ccc_engine   = CCCEngine(window_secs=WHALE_CONSENSUS_WINDOW_SECS, min_conf=MIN_WHALE_CONF)
     thresh_engine = ThresholdEngine()
 
@@ -544,6 +560,7 @@ async def main():
             http_client      = http_client,
             quality_model    = quality_model,
             chop_gate        = chop_gate,
+            bias_tracker     = bias_tracker,
         )
 
     whale_tracker = WhaleTracker(market_finder=mf, on_whale_trade=on_whale)
@@ -573,7 +590,7 @@ async def main():
         await asyncio.gather(
             whale_tracker.run(),
             market_refresh_loop(mf),
-            settlement_loop(executor, tg, quality_model),
+            settlement_loop(executor, tg, quality_model, bias_tracker),
             ccc_reload_loop(),
             whale_pool_reload_loop(),
             cleanup_loop(ccc_engine),
