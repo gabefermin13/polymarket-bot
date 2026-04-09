@@ -65,6 +65,11 @@ def test_clob_gate_passes_bid_dominates():
     assert _clob_gate_fires(300.0, 100.0) is False  # ratio 0.33 < 2.0
 
 
+def test_clob_gate_passes_when_bid_is_zero():
+    # bid=0 → denominator guard fires → gate passes (conservative fallback)
+    assert _clob_gate_fires(0.0, 500.0) is False
+
+
 # ── token_id selection ────────────────────────────────────────────────────────
 
 def _select_token_id(market: dict, direction: str) -> str:
@@ -80,3 +85,9 @@ def test_token_selection_up():
 def test_token_selection_down():
     market = {"up_token_id": "AAA", "down_token_id": "BBB"}
     assert _select_token_id(market, "Down") == "BBB"
+
+
+def test_token_selection_non_up_falls_to_down():
+    # any direction string that is not "Up" resolves to down_token_id
+    market = {"up_token_id": "AAA", "down_token_id": "BBB"}
+    assert _select_token_id(market, "UP") == "BBB"
