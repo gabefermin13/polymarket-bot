@@ -279,7 +279,7 @@ async def on_whale_trade(
     token_id = market["up_token_id"] if signal.direction == "Up" else market["down_token_id"]
     bid_usd, ask_usd = await polymarket_data.get_orderbook(token_id)
     if bid_usd > 0 and ask_usd > 0 and (ask_usd / bid_usd) > CLOB_VETO_RATIO:
-        logger.info(f"[CLOB] skip {asset} {signal.direction} — ask/bid={ask_usd/bid_usd:.2f} "
+        logger.info(f"[{BOT_LABEL}] {asset} {signal.direction} — CLOB imbalance ask/bid={ask_usd/bid_usd:.2f} "
                     f"(ask=${ask_usd:.0f} bid=${bid_usd:.0f})")
         _log_signal({**sig_rec, "skip_reason": "clob_imbalance"})
         return
