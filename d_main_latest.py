@@ -77,6 +77,8 @@ from dotenv import load_dotenv
 import drift_ev as _dev
 from drift_ev import detect_market_duration
 from ml_predict import get_predictor as _get_ml_predictor
+from coinbase_ws import CoinbaseWS, set_instance as _ws_set_instance
+from econ_calendar import EconCalendar
 
 
 
@@ -211,6 +213,70 @@ def _trade_zone() -> str:
     if h in _PEAK_HOURS:   return "peak"
     if h in _STRICT_HOURS: return "strict"
     return "standard"
+
+
+# ── Autocorrelation tracker ───────────────────────────────────────────────────
+
+class AutocorrTracker:
+    """
+    Track last N market outcomes per (asset, direction).
+
+    Consecutive wins → small conf boost (trend is persisting).
+    Consecutive losses → small conf penalty (regime flipped or signal broken).
+
+    Distinct from BiasTracker which blocks; this applies gradient adjustments.
+    """
+    _WINDOW = 3
+    _BOOST  = 0.04
+
+    def __init__(self):
+        from collections import defaultdict, deque
+        self._history = defaultdict(lambda: deque(maxlen=self._WINDOW))
+
+    def record(self, asset: str, direction: str, won: bool):
+        self._history[(asset.upper(), direction.lower())].append(won)
+
+    def get_conf_adj(self, asset: str, direction: str) -> float:
+        hist = list(self._history[(asset.upper(), direction.lower())])
+        if len(hist) < 2:
+            return 0.0
+        wr = sum(hist) / len(hist)
+        if wr >= 0.667:
+            return +self._BOOST
+        if wr <= 0.333:
+            return -self._BOOST
+        return 0.0
+
+    def warmup(self, positions_path: str, limit: int = 30):
+        import json
+        from pathlib import Path
+        from collections import defaultdict
+        p = Path(positions_path)
+        if not p.exists():
+            return
+        by_combo: dict = defaultdict(list)
+        try:
+            with open(p) as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                        if rec.get("event") != "close":
+                            continue
+                        status = rec.get("status", "")
+                        if status not in ("won", "lost"):
+                            continue
+                        sym = (rec.get("symbol") or "").split("-")[0].upper()
+                        d   = (rec.get("direction") or "").lower()
+                        if sym and d:
+                            by_combo[(sym, d)].append(status == "won")
+                    except Exception:
+                        pass
+        except Exception:
+            return
+        for (sym, d), outcomes in by_combo.items():
+            for won in outcomes[-limit:]:
+                self.record(sym, d, won)
+        logger.info(f"AutocorrTracker warmed up from {positions_path}")
 
 
 # ── Late-entry scanner constants ─────────────────────────────────────────────
@@ -447,11 +513,18 @@ async def _scan_once(
 
     bias_tracker: BiasTracker,
 
+    autocorr: "AutocorrTracker",
+
+    econ_cal: EconCalendar,
+
 ):
 
     now_ms = int(time.time() * 1000)
 
-
+    # Economic calendar blackout — skip entire scan cycle if macro release imminent
+    if await econ_cal.is_blackout(client):
+        logger.info("EconCalendar blackout active — skipping scan cycle")
+        return
 
     for asset in ASSETS:
 
@@ -557,9 +630,15 @@ async def _scan_once(
 
                 adj_conf = r2.conf  # ranging — no adjustment
 
+            # Autocorrelation adjustment — recent streak boosts/fades confidence
+            autocorr_adj = autocorr.get_conf_adj(asset, direction_pm)
+            adj_conf     = max(0.50, min(0.95, adj_conf + autocorr_adj))
+
             logger.info(
 
                 f"{asset} {direction_pm}: regime={regime or 'Ranging'} "
+
+                f"autocorr={autocorr_adj:+.3f} "
 
                 f"n={n_for_dir} conf {r2.conf:.3f}→{adj_conf:.3f}"
 
@@ -868,6 +947,10 @@ async def signal_scan_loop(
 
     bias_tracker: BiasTracker,
 
+    autocorr: "AutocorrTracker",
+
+    econ_cal: EconCalendar,
+
 ):
 
     logger.info(
@@ -886,7 +969,7 @@ async def signal_scan_loop(
 
             try:
 
-                await _scan_once(client, executor, mf, dc, tg, quality_model, chop_gate, bias_tracker)
+                await _scan_once(client, executor, mf, dc, tg, quality_model, chop_gate, bias_tracker, autocorr, econ_cal)
 
             except Exception as e:
 
@@ -908,7 +991,7 @@ async def signal_scan_loop(
 
 
 
-async def settlement_loop(executor: PolyExecutor, tg: TelegramAlerts, quality_model: QualityModel, bias_tracker: BiasTracker):
+async def settlement_loop(executor: PolyExecutor, tg: TelegramAlerts, quality_model: QualityModel, bias_tracker: BiasTracker, autocorr: "AutocorrTracker"):
 
     """Check and settle expired positions every 60 seconds. Sends Telegram on each outcome."""
 
@@ -951,6 +1034,8 @@ async def settlement_loop(executor: PolyExecutor, tg: TelegramAlerts, quality_mo
                         quality_model.record(f"{sym_part}_{dir_part}", won)
 
                         bias_tracker.record(sym_part.upper(), getattr(pos, "direction", ""), won)
+
+                        autocorr.record(sym_part.upper(), getattr(pos, "direction", ""), won)
 
                     pnl      = getattr(pos, "realized_pnl", 0.0) or 0.0
 
@@ -1238,6 +1323,17 @@ async def main():
 
     bias_tracker.warmup(f"{LOGS_DIR}/positions.jsonl")
 
+    autocorr = AutocorrTracker()
+
+    autocorr.warmup(f"{LOGS_DIR}/positions.jsonl")
+
+    econ_cal = EconCalendar()
+
+    # Start Coinbase WebSocket (real-time price feed for drift_ev)
+    _ws = CoinbaseWS(assets=ASSETS)
+    _ws_set_instance(_ws)
+    await _ws.start()
+
 
 
     # Register graceful shutdown
@@ -1284,9 +1380,9 @@ async def main():
 
         await asyncio.gather(
 
-            signal_scan_loop(executor, mf, dc, tg, quality_model, chop_gate, bias_tracker),
+            signal_scan_loop(executor, mf, dc, tg, quality_model, chop_gate, bias_tracker, autocorr, econ_cal),
 
-            settlement_loop(executor, tg, quality_model, bias_tracker),
+            settlement_loop(executor, tg, quality_model, bias_tracker, autocorr),
 
             market_refresh_loop(mf),
 
@@ -1311,6 +1407,8 @@ async def main():
 
 
     logger.info(f"[{BOT_LABEL}] Shutting down…")
+
+    await _ws.stop()
 
     await executor.close()
 
