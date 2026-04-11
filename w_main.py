@@ -30,9 +30,16 @@ import time
 from pathlib import Path
 
 import httpx
+
+import drift_ev as _dev
+from drift_ev import detect_market_duration, wait_for_ev_window
+from ml_predict import get_predictor as _get_ml_predictor
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ── ML predictor (graceful fallback if model not yet trained) ─────────────────
+_ml = _get_ml_predictor("/root/shared_ml")
 
 # ── Config ───────────────────────────────────────────────────────────────────
 BOT_LABEL       = os.getenv("BOT_LABEL",    "W")
@@ -45,8 +52,15 @@ WHALE_CONSENSUS_WINDOW_SECS = float(os.getenv("WHALE_CONSENSUS_WINDOW_SECS", "12
 CONF_BASE       = float(os.getenv("CONF_BASE", "0.55"))
 CONF_MAX        = float(os.getenv("CONF_MAX",  "0.82"))
 WHALE_MIN_SECS   = int(os.getenv("WHALE_MIN_SECS", "30"))
-CLOB_VETO_RATIO  = float(os.getenv("CLOB_VETO_RATIO", "2.0"))
-MIN_LIQUIDITY_USD = float(os.getenv("POLY_MIN_LIQUIDITY", "500"))
+CLOB_VETO_RATIO      = float(os.getenv("CLOB_VETO_RATIO",       "2.0"))
+MIN_LIQUIDITY_USD    = float(os.getenv("POLY_MIN_LIQUIDITY",    "500"))
+MAX_MARKET_SECS_LEFT = float(os.getenv("MAX_MARKET_SECS_LEFT",  "1800"))
+
+# S1-S10 directional filter
+DIR_VETO_N    = float(os.getenv("DIR_VETO_N",     "2.0"))   # opposing weighted signals → veto
+DIR_BOOST_N   = float(os.getenv("DIR_BOOST_N",    "2.0"))   # agreeing weighted signals → conf boost
+DIR_CONF_BOOST = float(os.getenv("DIR_CONF_BOOST", "0.05"))
+MIN_WHALE_ENTRY = float(os.getenv("MIN_WHALE_ENTRY", "0.52"))  # min ask price whale paid (copies entering moving markets)  # boost applied when signals agree
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 Path(LOGS_DIR).mkdir(parents=True, exist_ok=True)
@@ -65,16 +79,90 @@ for lib in ("httpx", "websockets", "hpack", "h2"):
     logging.getLogger(lib).setLevel(logging.WARNING)
 
 # ── Imports ───────────────────────────────────────────────────────────────────
-from market_finder   import MarketFinder
-from whale_tracker   import WhaleTracker, WhaleTrade, WHALE_ADDRESSES, WHALE_CONFIDENCE
-from poly_executor   import PolyExecutor
-from telegram_alerts import TelegramAlerts
-from ccc_engine      import CCCEngine
-from threshold_engine import ThresholdEngine
-from quality_model   import QualityModel
-from bias_tracker    import BiasTracker
-from choppiness_gate import ChoppinessGate
+from market_finder        import MarketFinder
+from whale_tracker        import WhaleTracker, WhaleTrade, WHALE_ADDRESSES, WHALE_CONFIDENCE
+from poly_executor        import PolyExecutor
+from telegram_alerts      import TelegramAlerts
+from ccc_engine           import CCCEngine
+from threshold_engine     import ThresholdEngine
+from quality_model        import QualityModel
+from choppiness_gate      import ChoppinessGate
+from direction_consensus  import DirectionConsensus
 import polymarket_data
+
+# ── Per-wallet consecutive-loss cooling-off ───────────────────────────────────
+class WalletCooldown:
+    """3 consecutive losses from the same wallet → 45-min cooling-off period.
+    One win resets the streak. Cooling-off expires automatically after the timeout.
+    Does not interfere with CCC calibration (which runs independently every 30 min).
+    """
+    STREAK_LIMIT  = 3
+    COOLDOWN_SECS = 45 * 60  # 45 minutes
+
+    def __init__(self):
+        self._streak:  dict = {}   # whale_name → consecutive loss count
+        self._cooloff: dict = {}   # whale_name → expiry timestamp
+
+    def is_cooling(self, whale_name: str) -> bool:
+        exp = self._cooloff.get(whale_name)
+        if exp is None:
+            return False
+        if time.time() >= exp:
+            del self._cooloff[whale_name]
+            self._streak[whale_name] = 0
+            return False
+        return True
+
+    def record(self, whale_name: str, won: bool):
+        if won:
+            self._streak[whale_name] = 0
+        else:
+            streak = self._streak.get(whale_name, 0) + 1
+            self._streak[whale_name] = streak
+            if streak >= self.STREAK_LIMIT:
+                expiry = time.time() + self.COOLDOWN_SECS
+                self._cooloff[whale_name] = expiry
+                logger.info(
+                    f"[WalletCooldown] {whale_name} — {streak} consecutive losses, "
+                    f"cooling off for {self.COOLDOWN_SECS // 60} min"
+                )
+
+    def warmup(self, positions_path: str):
+        """Reconstruct consecutive-loss streaks from closed positions on startup."""
+        import json as _json
+        from collections import defaultdict
+        wallet_trades: dict = defaultdict(list)
+        try:
+            with open(positions_path, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        p = _json.loads(line)
+                        if p.get("event") != "close":
+                            continue
+                        src = p.get("source", "")
+                        if ":" not in src:
+                            continue
+                        name = src.split(":", 1)[1].strip()
+                        wallet_trades[name].append(
+                            (p.get("ts_close", 0), p.get("status") == "won")
+                        )
+                    except Exception:
+                        pass
+        except FileNotFoundError:
+            return
+        cooling = 0
+        for name, trades in wallet_trades.items():
+            trades.sort()
+            streak = 0
+            for _, won in trades[-10:]:   # last 10 trades per wallet
+                streak = 0 if won else streak + 1
+            self._streak[name] = streak
+            if streak >= self.STREAK_LIMIT:
+                self._cooloff[name] = time.time() + self.COOLDOWN_SECS
+                cooling += 1
+        logger.info(
+            f"[WalletCooldown] Warmed: {len(wallet_trades)} wallets, {cooling} currently cooling off"
+        )
 
 # ── CCC calibration startup load ─────────────────────────────────────────────
 _CCC_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wallet_calibration.json")
@@ -159,16 +247,17 @@ def _ccc_to_confidence(ccc_score: float) -> float:
 # ── Whale event handler ───────────────────────────────────────────────────────
 
 async def on_whale_trade(
-    signal:           WhaleTrade,
-    executor:         PolyExecutor,
-    market_finder:    MarketFinder,
-    ccc_engine:       CCCEngine,
-    threshold_engine: ThresholdEngine,
-    tg:               TelegramAlerts,
-    http_client:      httpx.AsyncClient,
-    quality_model:    QualityModel,
-    chop_gate:        ChoppinessGate,
-    bias_tracker:     BiasTracker,
+    signal:              WhaleTrade,
+    executor:            PolyExecutor,
+    market_finder:       MarketFinder,
+    ccc_engine:          CCCEngine,
+    threshold_engine:    ThresholdEngine,
+    tg:                  TelegramAlerts,
+    http_client:         httpx.AsyncClient,
+    quality_model:       QualityModel,
+    chop_gate:           ChoppinessGate,
+    wallet_cooldown:     WalletCooldown,
+    direction_consensus: DirectionConsensus,
 ):
     # 1. Record event in activity window
     ccc_conf = WHALE_CONFIDENCE.get(signal.whale_addr, 0.0)
@@ -246,6 +335,11 @@ async def on_whale_trade(
         _log_signal({**sig_rec, "skip_reason": "too_close_to_expiry"})
         return
 
+    if seconds_left > MAX_MARKET_SECS_LEFT:
+        logger.info(f"[{BOT_LABEL}] {asset} {signal.direction} — market too far out ({seconds_left:.0f}s > {MAX_MARKET_SECS_LEFT:.0f}s max), skip")
+        _log_signal({**sig_rec, "skip_reason": "market_too_far_out"})
+        return
+
     # Choppiness gate (global)
     if chop_gate.is_paused():
         logger.info(
@@ -255,14 +349,41 @@ async def on_whale_trade(
         _log_signal({**sig_rec, "skip_reason": "choppy_market"})
         return
 
-    # Bias gate (per asset+direction combo)
-    if bias_tracker.is_paused(asset, signal.direction):
+    # Wallet cooling-off gate (per-wallet consecutive-loss streak)
+    if wallet_cooldown.is_cooling(signal.whale_name):
         logger.info(
             f"[{BOT_LABEL}] {asset} {signal.direction} — "
-            f"bias suppressed, skip"
+            f"wallet {signal.whale_name} cooling off, skip"
         )
-        _log_signal({**sig_rec, "skip_reason": "bias_suppressed"})
+        _log_signal({**sig_rec, "skip_reason": "wallet_cooling"})
         return
+
+    # S1-S10 directional filter — veto if signals clearly oppose, boost if they agree
+    dir_n = 0.0
+    try:
+        r_dir = await direction_consensus.evaluate(
+            client    = http_client,
+            asset     = asset,
+            direction = signal.direction,
+            token_id  = signal.token_id,
+        )
+        if r_dir.direction == signal.direction:
+            dir_n = r_dir.n_for_dir
+            if dir_n >= DIR_BOOST_N:
+                consensus_conf = min(0.95, consensus_conf + DIR_CONF_BOOST)
+                sig_rec["dir_conf_boost"] = DIR_CONF_BOOST
+        elif r_dir.direction and r_dir.direction not in ("NEUTRAL", "BALANCED", "NONE", "FLAT", ""):
+            dir_n = -r_dir.n_for_dir
+            if r_dir.n_for_dir >= DIR_VETO_N:
+                logger.info(
+                    f"[{BOT_LABEL}] {asset} {signal.direction} — "
+                    f"dir signals oppose {r_dir.direction} n={r_dir.n_for_dir:.1f} — veto"
+                )
+                _log_signal({**sig_rec, "skip_reason": "dir_signal_veto", "dir_n": dir_n})
+                return
+        sig_rec["dir_n"] = dir_n
+    except Exception as e:
+        logger.debug(f"dir filter skipped: {e}")
 
     # Quality gate (per entity)
     entity_key = f"{signal.whale_name.lower()}_{signal.direction.lower()}"
@@ -295,12 +416,80 @@ async def on_whale_trade(
         _log_signal({**sig_rec, "skip_reason": "clob_imbalance"})
         return
 
+    # Whale entry price gate: only copy high-conviction entries (whale entered moving market)
+    if signal.price < MIN_WHALE_ENTRY:
+        logger.info(
+            f"[{BOT_LABEL}] {asset} {signal.direction} -- whale entry {signal.price:.2f} "
+            f"below MIN_WHALE_ENTRY {MIN_WHALE_ENTRY:.2f} -- skip"
+        )
+        _log_signal({**sig_rec, "skip_reason": "whale_entry_too_cheap",
+                     "whale_price": signal.price, "min_entry": MIN_WHALE_ENTRY})
+        return
+
+    # Drift EV gate: enter only when mispricing gives exploitable EV
+    _dur = detect_market_duration(market.get("title", ""), market["end_time"] - time.time())
+    _ev  = await _dev.compute_ev(
+        asset, signal.direction, token_id, market["condition_id"],
+        market["end_time"], _dur, http_client,
+    )
+    if not _ev.has_edge:
+        # Wait for EV window to open (whale may have entered before resolution start)
+        logger.info(
+            f"[{BOT_LABEL}] {asset} {signal.direction} -- EV {_ev.ev:+.3f} below threshold "
+            f"-- waiting up to {_dev.EV_WINDOW_TIMEOUT}s"
+        )
+        _ev = await _dev.wait_for_ev_window(
+            asset, signal.direction, token_id, market["condition_id"],
+            market["end_time"], _dur, http_client,
+        )
+        if _ev is None:
+            logger.info(f"[{BOT_LABEL}] {asset} {signal.direction} -- no EV window found -- skip")
+            _log_signal({**sig_rec, "skip_reason": "low_ev"})
+            return
+    # EV positive: boost CCC confidence
+    consensus_conf = min(0.95, consensus_conf + _ev.ev * _dev.EV_CONF_BOOST)
+    sig_rec["ev"]       = round(_ev.ev, 4)
+    sig_rec["p_win"]    = round(_ev.p_win, 4)
+    sig_rec["drift_pct"]= round(_ev.drift_signed * 100, 4)
+    logger.info(
+        f"[{BOT_LABEL}] {asset} {signal.direction} -- EV gate PASS "
+        f"{_ev.summary()} consensus_conf->{consensus_conf:.3f}"
+    )
+
+    # ML gate: calibrated P(win) score, Kelly scaling
+    _start_ts = market["end_time"] - _dur
+    _ml_score = await _ml.score(
+        symbol    = asset,
+        direction = signal.direction,
+        start_ts  = _start_ts,
+        end_ts    = market["end_time"],
+        ask_price = _ev.ask,
+        extra_features = {
+            "ev":           _ev.ev,
+            "p_win":        _ev.p_win,
+            "drift_pct":    _ev.drift_pct,
+            "drift_signed": _ev.drift_signed,
+        },
+    )
+    _trade_ok, _ml_reason = _ml.should_trade(_ml_score, _ev.ask)
+    if not _trade_ok:
+        logger.info(f"[{BOT_LABEL}] {asset} {signal.direction} -- ML skip: {_ml_reason}")
+        _log_signal({**sig_rec, "skip_reason": _ml_reason,
+                    "ml_pwin": round(_ml_score.p_win, 4),
+                    "ml_ev": round(_ml_score.ev, 4)})
+        return
+    logger.info(
+        f"[{BOT_LABEL}] {asset} {signal.direction} -- ML PASS "
+        f"p_win={_ml_score.p_win:.3f} kelly_scale={_ml_score.kelly_scale:.2f}x "
+        f"has_model={_ml_score.has_model}"
+    )
+
     pos = await executor.execute(
         market           = market,
         direction        = signal.direction,
         confidence       = consensus_conf,
         source           = f"whale:{signal.whale_name}",
-        kelly_multiplier = kelly_mult,
+        kelly_multiplier = kelly_mult * _ml_score.kelly_scale,
     )
 
     if pos:
@@ -320,6 +509,7 @@ async def on_whale_trade(
         msg = (
             f"[{BOT_LABEL}] {asset} {signal.direction} | "
             f"ccc={ccc.ccc_score:.3f} thr={threshold:.3f} n={ccc.n_active} "
+            f"dir={dir_n:+.1f} "
             f"@{entry_px:.3f} ${cost:.2f}"
         )
         logger.info(f"Entered: {msg}")
@@ -334,7 +524,7 @@ async def on_whale_trade(
 # ── Loops ─────────────────────────────────────────────────────────────────────
 
 async def settlement_loop(executor: PolyExecutor, tg: TelegramAlerts, quality_model: QualityModel,
-                          bias_tracker: BiasTracker):
+                          wallet_cooldown: WalletCooldown):
     while not _shutdown.is_set():
         try:
             open_before = {p.id for p in executor.open_positions()}
@@ -356,8 +546,7 @@ async def settlement_loop(executor: PolyExecutor, tg: TelegramAlerts, quality_mo
                     if whale_name:
                         entity_key = f"{whale_name.lower()}_{pos.direction.lower()}"
                         quality_model.record(entity_key, won)
-                        asset_sym = pos.symbol.split("-")[0]
-                        bias_tracker.record(asset_sym, pos.direction, won)
+                        wallet_cooldown.record(whale_name, won)
                     pnl     = pos.realized_pnl or 0.0
                     icon    = "✅" if won else "❌"
                     outcome = "WON" if won else "LOST"
@@ -385,7 +574,7 @@ async def settlement_loop(executor: PolyExecutor, tg: TelegramAlerts, quality_mo
 
 
 async def ccc_reload_loop():
-    """Reload wallet_calibration.json every 30 minutes."""
+    """Reload wallet_calibration.json and ML model every 30 minutes."""
     while not _shutdown.is_set():
         try:
             await asyncio.wait_for(_shutdown.wait(), timeout=1800)
@@ -394,6 +583,10 @@ async def ccc_reload_loop():
         else:
             break
         _reload_ccc()
+        try:
+            _ml.maybe_reload()
+        except Exception as e:
+            logger.warning(f"ML reload error: {e}")
 
 
 async def whale_pool_reload_loop():
@@ -540,27 +733,29 @@ async def main():
             else None
         )
     )
-    chop_gate    = ChoppinessGate()
-    bias_tracker = BiasTracker()
-    bias_tracker.warmup(f"{LOGS_DIR}/positions.jsonl")
+    chop_gate       = ChoppinessGate()
+    wallet_cooldown = WalletCooldown()
+    wallet_cooldown.warmup(f"{LOGS_DIR}/positions.jsonl")
     ccc_engine   = CCCEngine(window_secs=WHALE_CONSENSUS_WINDOW_SECS, min_conf=MIN_WHALE_CONF)
     thresh_engine = ThresholdEngine()
+    dir_consensus = DirectionConsensus()
 
     # Single shared HTTP client for threshold signals
     http_client = httpx.AsyncClient(timeout=15.0)
 
     async def on_whale(sig: WhaleTrade):
         await on_whale_trade(
-            signal           = sig,
-            executor         = executor,
-            market_finder    = mf,
-            ccc_engine       = ccc_engine,
-            threshold_engine = thresh_engine,
-            tg               = tg,
-            http_client      = http_client,
-            quality_model    = quality_model,
-            chop_gate        = chop_gate,
-            bias_tracker     = bias_tracker,
+            signal               = sig,
+            executor             = executor,
+            market_finder        = mf,
+            ccc_engine           = ccc_engine,
+            threshold_engine     = thresh_engine,
+            tg                   = tg,
+            http_client          = http_client,
+            quality_model        = quality_model,
+            chop_gate            = chop_gate,
+            wallet_cooldown      = wallet_cooldown,
+            direction_consensus  = dir_consensus,
         )
 
     whale_tracker = WhaleTracker(market_finder=mf, on_whale_trade=on_whale)
@@ -590,7 +785,7 @@ async def main():
         await asyncio.gather(
             whale_tracker.run(),
             market_refresh_loop(mf),
-            settlement_loop(executor, tg, quality_model, bias_tracker),
+            settlement_loop(executor, tg, quality_model, wallet_cooldown),
             ccc_reload_loop(),
             whale_pool_reload_loop(),
             cleanup_loop(ccc_engine),
