@@ -10,7 +10,7 @@ A whale copy-trading + directional signal system for Polymarket Up-or-Down marke
 
 **Core insight:** Certain Polymarket wallets win 80-100% of their Up-or-Down trades over hundreds of markets. By monitoring their on-chain Polygon activity in real time and requiring N whales to agree (consensus filter), we copy only their highest-conviction signals.
 
-**Current mode:** Paper trading — no real orders placed. Shared bankroll reset to $97.28 for final test; running balance tracked in `/root/shared_bankroll.json`.
+**Current mode:** LIVE — real orders on Polymarket CLOB. Gone live 2026-04-12. Shared bankroll at `/root/shared_bankroll.json`. Starting bankroll $97.28; balance as of go-live: $279.20.
 
 ---
 
@@ -40,7 +40,7 @@ C1/C2 whale lists are manually curated. C3/C4 are auto-managed by `scan16_auto.p
 | D7 | `/root/kalshiedge_dbot_d7/` | 7 of 7 | `logs_d7/bot.log` | **PAUSED** (commented out of watchdog) |
 
 D2 is in watchdog DBOTS (monitored). All others commented out with `# PAUSED # ` prefix.
-D2 trades: **BTC, ETH, DOGE, XRP** (SOL removed — poor WR). 5-min and 15-min Up-or-Down markets.
+D2 trades: **BTC, DOGE, XRP** (SOL and ETH removed — poor WR). 5-min and 15-min Up-or-Down markets.
 **D2 time-zone gates (2026-04-09 fifth session):** Dead zone (11-12 UTC) = skip entirely. Strict zone (06-08, 13, 15-17 UTC) = require n≥3.0 AND conf≥0.70. Peak zone (09-10, 14, 18-21 UTC) = Kelly×1.2. Standard (all other hours) = normal thresholds. MIN_CONFIDENCE raised 0.55→0.65.
 **D4 paused 2026-04-08:** 34% WR, -$232.
 **D2 start/stop:** controlled via dashboard (`POST /api/bot/d2/start` or `stop`). Flag `/root/d2_paused` prevents watchdog revival when stopped.
@@ -320,12 +320,23 @@ TELEGRAM_CHAT_ID=6400219232
 **NOTE:** Dashboard restart requires uvicorn — `pkill -f "uvicorn dashboard"` then `uvicorn dashboard:app --host 0.0.0.0 --port 8080`. Not `python3 dashboard.py`.
 **NOTE:** 130-trade analysis 2026-04-11 (eleventh session) — BTC Down 77% WR +$69.73 is carrying all profits. ETH Up/Down and BTC Up are systematically negative. W:L ratio 1.14x (structural: avg entry ~$0.50 gives natural 1.0x ratio). Path to 1.3-1.5x W:L: combo cleanup first, then ML/EV quality improvement.
 **NOTE:** ML backfill expanded to 164,094 markets 2026-04-11 (eleventh session) — `training_data.jsonl` complete, 0 errors. Ready for retraining model v6 (v5 was trained on 95K markets).
+**NOTE:** Gone live 2026-04-12 (twelfth session) — PAPER_TRADING=0 set in both D2 and W .env. Polymarket credentials added: POLYMARKET_PRIVATE_KEY + POLYMARKET_ADDRESS (proxy wallet). ClobClient initialized with `signature_type=1, funder=ADDR` for Magic.link proxy wallet architecture. API key derived: `3f87d8e5-3d99-feea-72e2-ed4a381b6027`. Connection verified via `create_or_derive_api_creds()` + `get_orders()` authenticated access.
+**NOTE:** Polymarket proxy wallet architecture 2026-04-12 — Magic.link key derives to EOA address (different from deposit address). Deposit address is a CREATE2 proxy wallet. `py_clob_client` requires `signature_type=1` (POLY_PROXY) and `funder=PROXY_WALLET_ADDRESS`. Without these, orders fail silently. Both poly_executor.py copies updated.
+**NOTE:** econ_calendar.py ISO parser fix 2026-04-12 (twelfth session) — `_parse_event_ts()` rewrote to handle ISO datetime (`"2026-04-14T08:30:00-04:00"`) from cache file. Prior version expected separate date/time fields and silently failed open (no blackouts fired). Both D2 and W copies fixed.
+**NOTE:** Watchdog race condition fix 2026-04-12 (twelfth session) — dashboard `api_stop` added `await asyncio.sleep(1)` between `BOT_PAUSE_FLAGS[bot].touch()` and `_kill_bot()`. Without this, watchdog cron could fire at the same second the bot was killed and see the flag not yet created — reviving the bot immediately. Fix: write flag, wait 1s, then kill.
+**NOTE:** W .env misconfiguration fixed 2026-04-12 — was written with THRESHOLD_BASE=0.10, MIN_ASK_PRICE=0.05, etc. (corrupted values). W ran with bad config 07:55-09:22 UTC April 12. Restored to correct values from CLAUDE.md.
+**NOTE:** BiasTracker re-enabled as hard block 2026-04-12 — Step 3 (demote BiasTracker to logging-only) was partially implemented but reverted after 7 consecutive losses on BTC Down. BiasTracker remains a hard block gate. Revisit demotion only after AutocorrTracker accumulates ≥5 trades per combo (WINDOW=5).
+**NOTE:** Per-asset open position cap added to D2 d_main.py 2026-04-12 — `MAX_XRP_POSITIONS=2`, `MAX_ASSET_POSITIONS=3` env vars. Gate inserted after combo_min_conf check. Skip reason: `asset_open_cap`.
+**NOTE:** 30¢ YES→Down flip added to D2 d_main.py 2026-04-12 (Step 2) — if direction="Up" and `_ev.ask < 0.30`, flip to "Down" market and re-run EV. Only executes if a Down market exists.
+**NOTE:** MarketOrderArgs missing `side` arg fixed 2026-04-12 — `poly_executor.py` called `MarketOrderArgs(token_id, amount, price, order_type)` but the signature requires `side` as the 3rd positional arg. Every live order since go-live failed silently with `live_execution_failed`. Fixed: `side="BUY"` added. Both D2 and W poly_executor.py patched.
+**NOTE:** ML per-combo boost+floor override added to W w_main.py 2026-04-12 — after `_ml.should_trade()` fails, checks `ML_BOOST_{ASSET}_{DIR}` (additive boost to p_win) and `ML_MIN_{ASSET}_{DIR}` (lowered floor). `ML_BOOST_BTC_DOWN=0.15` + `ML_MIN_BTC_DOWN=0.55` in W .env — BTC Down (77% WR best combo) was being blocked at p=0.41 by ML v5 threshold of 0.70. Boosted: 0.41+0.15=0.56 >= 0.55 → passes. Not a full bypass — still requires boosted p_win to clear the lowered floor.
 **NOTE:** MAX_MARKET_SECS_LEFT=900 confirmed working in D2 2026-04-11 (eleventh session) — gate at line 7744, 12-space indent inside `_scan_once()` try block. `continue` correctly skips to next `for asset in ASSETS:` iteration. All log violations were from before investigation window.
 **NOTE:** W-bot BiasTracker replaced with WalletCooldown 2026-04-09 (fifth session) — BiasTracker was blocking 68% of all W signals (per-combo; if DOGE Up had a bad run, ALL DOGE Up blocked). Replaced with per-wallet streak: 3 consecutive losses → 45-min cooldown for that wallet. Much lighter gate.
 **NOTE:** W-bot S1-S10 directional filter added 2026-04-09 (fifth session) — After CCC threshold check, calls `DirectionConsensus.evaluate()`. If signals agree with whale direction and n≥DIR_BOOST_N (2.0) → conf +0.05. If signals oppose and n≥DIR_VETO_N (2.0) → veto (`dir_signal_veto`). Cached via ThresholdEngine (no duplicate API calls). Entry Telegram shows `dir=+X.X` or `dir=-X.X`.
 **NOTE:** W-bot whale pool expanded 95%+ WR 2026-04-09 (fifth session) — `W_WR_MIN` lowered 99→95, cap removed (`W_POOL_CAP=500`). scan16 found 374 wallets 95%+ WR; 240+ written to whale_pool.json. W pool updated every 20 new wallets (not just at C3 trigger).
 **NOTE:** Force-settle pattern for stuck positions — use `httpx.Client` (not urllib — gets 403) to fetch `clob.polymarket.com/last-trade-price?token_id=FULL_TOKEN`. Only settle if price ≤0.15 or ≥0.85. Write close events directly to positions.jsonl; credit payout via `fcntl` locking to shared_bankroll.json. Used 2026-04-09 (fifth session) to recover $28.54 from 6 expired positions.
-**NOTE:** Polygon WebSocket stale detection — if `poly_events` counter in DIAG frozen for 30+ min, WebSocket is connected but dead (drpc.org silent). Fix: restart W-bot for fresh connection. Occurred 2026-04-09 fifth session; `poly_events=203212` frozen 65+ min.
+**NOTE:** Polygon WebSocket stale detection — if `poly_events` counter in DIAG frozen for 30+ min, WebSocket is connected but dead. Fix: restart bot for fresh connection. Occurred 2026-04-09 fifth session; `poly_events=203212` frozen 65+ min.
+**NOTE:** Polygon WebSocket switched to publicnode 2026-04-12 — drpc.org started accepting TCP connections but silently ignoring `eth_subscribe` requests (no sub_id ever returned). Switched all whale_tracker.py files (C1/C2/C3/C4/W) to `wss://polygon-bor-rpc.publicnode.com`. ankr requires API key (401). publicnode confirmed working: receives live CTF OrderFilled events.
 **NOTE:** S9 (Coinbase premium) XRP pair fix — added `"XRP": "XXRPZUSD"` to `_KRAKEN_PAIRS` in `direction_signals.py`. Without this, S9 returned NEUTRAL for XRP (KeyError caught silently).
 **NOTE:** scan16_auto.py cron changed to `0 */6 * * *` (every 6 hours) — was run-on-demand / `*/30`; now scheduled so W pool stays fresh.
 **NOTE:** drift_ev.py deployed 2026-04-10 (sixth session) — shared module in both D2 and W dirs. Implements Brownian bridge EV gate: P(win)=Φ(drift/σ(τ)), EV=P(win)×0.99−ask, threshold 0.04. Reference price = Coinbase candle OPEN at market resolution window start. All constants env-overridable.
@@ -357,7 +368,7 @@ TELEGRAM_CHAT_ID=6400219232
 - **Network:** Polygon (chain ID 137)
 - **CTF Exchange:** `0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e`
 - **Event topic:** `0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6` (OrderFilled)
-- **WebSocket RPC:** `wss://polygon.drpc.org` - publicnode.com silently broke log streaming
+- **WebSocket RPC:** `wss://polygon-bor-rpc.publicnode.com` — switched from drpc.org (2026-04-12, drpc.org stopped responding to eth_subscribe). ankr requires API key (401). publicnode confirmed: subscribes + receives live CTF OrderFilled events.
 - **Buy detection:** whale gives USDC (asset ID = 0) = buying position token
 - **Sell detection:** whale gives position token = exiting (ignored, not copied)
 - **Loser suppression:** only suppresses if loser is on one side AND no whale on the other
@@ -548,176 +559,7 @@ nohup python3 d_main.py >> logs_d3/bot.log 2>&1 &
 
 ---
 
-> Older session logs archived to [SESSIONS.md](https://github.com/SierraNevadapng/polymarket-bot/blob/main/SESSIONS.md)
-
-## Session Status (last updated 2026-04-11 UTC — eleventh session)
-
-### Completed This Session — 2026-04-11 (eleventh session)
-
-#### Combo Cleanup — D2 + W
-- **130-trade analysis:** BTC Down 77% WR +$69.73 is the sole profit driver. ETH Up/Down 31-33% WR, BTC Up 30% WR — all systematically negative.
-- **D2:** ETH removed from `ASSETS`. Now `["BTC", "DOGE", "XRP"]`. `ML_MIN_BTC_UP=0.99` effectively blocks BTC Up.
-- **W:** `_BLOCKED_COMBOS = {("ETH","Up"),("ETH","Down"),("BTC","Up")}` added to `on_whale_trade()`.
-- **Combo-tier Kelly multiplier** on both bots: BTC Down=1.3×, XRP Down/DOGE Up/XRP Up=1.0×, default=0.8×. Env-overridable `TIER_KELLY_*` vars.
-- **W:L ratio:** 1.14× structural (driven by ~$0.50 avg entry price). Path to 1.3-1.5×: combo cleanup first, then ML/EV quality improvement.
-
-#### Dashboard Fixes
-- `_balance_history()`: close events only, delta=realized_pnl, starts from bankroll.json `initial_balance`.
-- `_compute_balances()`: total/liquid/deployed three-way breakdown.
-- Hero: 5 cells — Total Balance, Liquid Cash, Deployed, P&L, Win Rate.
-- Chart timezone: America/Los_Angeles.
-- Stale `setEl('h-open', ...)` / `setEl('h-locked', ...)` calls removed from `loadOpenPositions()`.
-
-#### ML Backfill Expanded
-- ml_backfill.py completed on 164,094 markets (expanded from 91K). `training_data.jsonl` ready.
-- Model v6 retrain pending — run `ml_train.py` on new dataset.
-
----
-
-## Session Status (last updated 2026-04-10 UTC — eighth session)
-
-### Completed This Session — 2026-04-10 (eighth session)
-
-#### ML Dataset — Completed (ninth session)
-- **Trade filtering:** COMPLETE. 157M rows across 31,279 chunk files in `C:\tmp\ml_data\_trade_chunks\`.
-- **ask_price extraction:** `build_ask_prices.py` extracts earliest buy price per condition_id from chunks. Handles both USDC orientations (maker_asset_id='0' AND taker_asset_id='0'). Output: `_ask_prices.json`.
-- **Clean dataset:** 95,410 rows (47,705 Up + 47,705 Down) — only markets with real volume AND real on-chain ask_price. Dropped 31K zero-volume markets and 3K off-chain-only markets. Saved to `markets_updown.parquet`.
-- **direction column:** Derived from `outcome_prices` field. Two rows per market — one for each side. Up outcome=1 if Up won; Down outcome=1 if Down won.
-- **NOTE:** 3,058 markets had Polymarket volume but NO on-chain trades — volume was from off-chain CLOB matching. Cannot recover ask_price for these from the dataset. Dropped.
-
-#### ML Backfill — Bulk Pre-fetch Architecture (ninth session)
-- **Problem:** Per-market API approach = 572K API calls, ~12 hours (bottleneck: network round-trip latency ~300ms each).
-- **Solution:** Pre-fetch full price history per symbol in bulk → 24K API calls total → features computed locally from cache. 24x fewer round trips. ~30 min total.
-- **New file:** `ml_prefetch.py` — downloads complete Coinbase 1-min candles, OKX funding rate history, OKX perp candles, Binance klines for BTC/ETH/DOGE/XRP for the full date range (2025-03-12 to 2026-01-25). Saves to `C:\tmp\ml_data\price_cache\`.
-- **Updated:** `ml_backfill.py` — reads from local price cache instead of making API calls. Falls back to 0.0 for missing data points (Binance CVD only available last 90 days).
-- **Skipped for historical:** S9 (Kraken premium, IC~0, Kraken rate limit 1/sec = 43 min alone) — set to 0.0 in training data. Live signal still uses Kraken.
-- **Cache format:** One parquet per symbol per source. e.g. `price_cache/cb_BTC.parquet` — columns: ts (unix), open, high, low, close, volume.
-
-#### ML Integration — d_main.py + w_main.py Wired
-Both bots now have ML gate integrated. Local files updated: `C:\tmp\d_main_latest.py` and `C:\tmp\w_main.py`.
-
-**Changes to both files:**
-- `from ml_predict import get_predictor as _get_ml_predictor` added
-- `_ml = _get_ml_predictor("/root/shared_ml")` initialized at startup (graceful fallback if no model)
-- ML gate inserted after EV gate pass, before `executor.execute()`:
-  - Calls `_ml.score(symbol, direction, start_ts, end_ts, ask_price, extra_features={ev, p_win, drift})`
-  - `should_trade()` returns False → log `ml_low_pwin_X.XXX` or `ml_low_ev_X.XXX`, skip trade
-  - Pass: `kelly_multiplier *= score.kelly_scale` (0.5× at threshold, 1.0× at 0.60, 1.5× at 0.70+)
-- **No model loaded:** `should_trade()` returns True, `kelly_scale=1.0` — bots run exactly as before
-
-**d_main_latest.py specific:**
-- New `ml_reload_loop()` added — calls `_ml.maybe_reload()` every 30 min
-- Wired into `asyncio.gather()` alongside signal_scan_loop, settlement_loop, market_refresh_loop
-
-**w_main.py specific:**
-- `_ml.maybe_reload()` added to existing `ccc_reload_loop()` — no new loop needed
-
-**Deployment pending** — deploy after model trained.
-
----
-
-### Session Status (last updated 2026-04-10 UTC — seventh session)
-
-### Completed This Session — 2026-04-10 (seventh session)
-
-#### Binance Proxy — Frankfurt Droplet
-- **Problem:** Binance returns HTTP 451 (geo-block) on NYC VPS. Binance has 5-10x Coinbase volume — needed for CVD, OI, liquidation data.
-- **Solution:** DigitalOcean Frankfurt droplet ($4/mo, 512MB) — not geo-blocked for Binance.
-- **Droplet:** `138.197.181.139` — username `root`, password `BASILSK20$` (same base password as NYC VPS). SSH key: `~/.ssh/id_ed25519`.
-- **Proxy:** `C:\tmp\binance_proxy.py` deployed to `/root/binance_proxy.py`. Runs as systemd service (`binance-proxy.service`, auto-restarts on crash/reboot).
-  - Endpoint: `http://138.197.181.139:8081/{binance_path}?token=poly_binance_proxy_2026`
-  - Auth: `?token=poly_binance_proxy_2026` required on all requests. Returns 401 on bad token.
-  - Dependencies installed via venv: `/root/proxyenv/bin/python3`
-- **Verified from NYC VPS:** BTC/ETH prices, klines, aggTrades all working. Auth rejection working.
-- **Usage in bot code:** `BINANCE_PROXY="http://138.197.181.139:8081"`, `PROXY_TOKEN="poly_binance_proxy_2026"`
-
-#### ML Pipeline — Full Stack Built
-Architecture shift: replace sequential gate stack (99.2% rejection rate) with XGBoost calibrated P(win) model. Trades below threshold get smaller Kelly size instead of hard block — increases trade volume while improving quality.
-
-**Files built (all in `C:\tmp\`):**
-
-| File | Purpose |
-|------|---------|
-| `ml_features.py` | Live feature engineering — S1/S3/S9/S10 + Binance CVD/OI/momentum/volume via Frankfurt proxy |
-| `ml_filter_dataset.py` | Filters 36GB parquet → crypto Up-or-Down markets with outcomes |
-| `ml_backfill.py` | Reconstructs signal features for historical markets using Coinbase/Binance historical data |
-| `ml_train.py` | XGBoost trainer with Platt scaling calibration + threshold analysis + CV AUC scoring |
-| `ml_predict.py` | Live inference module — loads model, returns MLScore(p_win, ev, kelly_scale) |
-
-**Model architecture (v5 — deployed 2026-04-11):**
-- XGBoost (n_estimators=600, max_depth=6, learning_rate=0.03, gamma=1.0) with Platt scaling calibration (CalibratedClassifierCV, cv=5)
-- Features: ask_price, hour_utc, minute_utc, day_of_week, duration_secs, s1_momentum, s1_conf, s3_funding, s3_conf, bn_momentum_1m/5m/15m/30m/60m, bn_volume_ratio, realized_vol_30m, price_vs_ma20/60, drift_pct, drift_signed, ev, p_win + symbol/direction one-hots + symbol×direction combo features + engineered (mom_agreement, mom_consistency, is_peak/dead/strict_hour, ev_x_duration, cheap_entry)
-- **Dropped** s9_premium, s10_basis, bn_cvd_1m from training (90-100% zeros historically — noise)
-- CV AUC: 0.774 | Holdout WR at p≥0.70: 83.4% (full holdout), 90.9% (last 30 days)
-- **Deploy threshold: p≥0.70** (not p≥0.65 — holdout gap widest in 0.65-0.70 band)
-- Kelly scaling: p_win at threshold → 0.5×, at 0.60 → 1.0×, at 0.70+ → 1.5×
-- Hot-reload: `_ml.maybe_reload()` in ccc_reload_loop picks up retrained model every 30 min
-- Retraining: rolling 90-day window via ml_calibrate.py cron (*/30) — prevents stale regime dilution
-- Backfill: parallel 8-worker multiprocessing (9.6 min for 95K markets)
-- **Critical fix**: features computed at `window_start_ts = end_ts - duration_secs` (resolution window start), NOT market creation time. Wrong timestamps → AUC 0.505; correct → AUC 0.774.
-
-**Integration plan for d_main.py / w_main.py:**
-```python
-from ml_predict import get_predictor
-_ml = get_predictor("/root/shared_ml")
-score = await _ml.score(symbol, direction, start_ts, end_ts, ask_price,
-                        extra_features={"ev": _ev.ev, "p_win": _ev.p_win})
-trade_ok, reason = _ml.should_trade(score, ask_price)
-if not trade_ok:
-    _log_signal({**sig_base, "executed": False, "skip_reason": reason})
-    continue
-pos, _ = await executor.execute(..., kelly_multiplier=adj_kelly * score.kelly_scale)
-```
-
-#### 36GB Polymarket Dataset
-- **Source:** https://github.com/jon-becker/prediction-market-analysis — `https://s3.jbecker.dev/data.tar.zst`
-- **Downloaded to:** `C:\Users\gabri\Downloads\data.tar.zst\data.tar.zst` (36GB, zstd-compressed)
-- **Extracted to:** `C:\tmp\data\` — contains `polymarket/markets/` (41 parquet files, 408,863 markets) and `polymarket/trades/` (40,454 parquet files)
-- **Decompression:** Used `zstandard` Python library (zstd CLI had path issues). `python -c "import zstandard; ..."` then `tar -xf data.tar`
-- **Filtered markets:** `ml_filter_dataset.py` produced `C:\tmp\ml_data\markets_updown.parquet`
-  - 91,148 resolved crypto Up-or-Down markets (BTC/ETH/XRP/DOGE)
-  - Near-perfect balance: 45,653 Up wins vs 45,495 Down wins
-  - BTC: 32,173 | ETH: 31,845 | XRP: 27,106 | DOGE: 24
-  - Duration: 300s (5-min) = 52,207 markets, 900s (15-min) = 36,578
-  - **Labels derived from `outcome_prices` field** — no resolution methodology reverse-engineering needed
-- **Trade filtering:** IN PROGRESS (eighth session) — fixed to match by token ID (not condition_id). 12 workers, resume-safe. ~27.9M matching rows found. Outputs real `ask_price` per market joined back to markets_updown.parquet.
-
-#### Key Dataset Insight
-`outcome_prices` field on closed Polymarket markets directly encodes resolution: `[1.0, 0.0]` = Up/Yes won, `[0.0, 1.0]` = Down/No won. This eliminates the need to reverse-engineer Polymarket's resolution methodology from Coinbase/Binance prices.
-
----
-
-### Completed This Session — 2026-04-10 (sixth session)
-
-#### Latency Arbitrage / Mispricing Layer — drift_ev.py
-- **Core insight:** Polymarket CLOB lags real asset price movements. When asset has drifted from resolution-window reference price, Brownian bridge gives P(win) = Φ(drift / σ(τ)). If P(win) × 0.99 − ask ≥ 0.04 → exploitable EV.
-- **Module:** `C:\tmp\drift_ev.py` (shared, deployed to both bot dirs)
-  - `EVResult` dataclass: ev, p_win, ask, drift, drift_signed, ref_price, curr_price, secs_remaining, vol_daily, sigma_tau, has_edge
-  - `compute_ev()`: parallel asyncio.gather of ref_price (Coinbase 1-min candle OPEN at market_start_ts), curr_price (ticker), CLOB ask, realised vol. Returns EVResult.
-  - `wait_for_ev_window()`: polls compute_ev every 5s for up to 90s after whale signal fires
-  - `detect_market_duration()`: regex extracts window duration from title ("7:20PM–7:25PM" → 300s); fallback heuristic
-  - `_pwin(drift_signed, tau, vol_daily)`: `P = Φ(drift / (vol × √(τ/86400)))` via math.erf; clamped [0.01, 0.99]
-  - Reference price: Coinbase 1-min candle OPEN at `end_time − market_duration_secs` (resolution window start); cached forever per condition_id
-  - Caches: vol per asset (900s), curr_price per asset (10s)
-- **D2 gate chain addition** (after CLOB gate, before execute):
-  - Skip + log `low_ev` if ev < MIN_EV_THRESHOLD (0.04)
-  - Pass: `adj_conf += ev × EV_CONF_BOOST (0.5)` — confidence boosted proportionally to edge
-- **W-bot additions:**
-  - `MIN_WHALE_ENTRY=0.52` gate: skip if whale paid < $0.52 (entering cheap = no drift = no edge; analysis showed 0.65–0.70 whales 100% WR, 0.55 whales 0% WR)
-  - `compute_ev()` + `wait_for_ev_window()` after market find — waits up to 90s polling every 5s if EV not yet positive
-  - Boosts `consensus_conf` by `ev × EV_CONF_BOOST` when EV passes
-- **Deployed:** drift_ev.py to both `/root/kalshiedge_dbot_d2/` and `/root/kalshiedge_whalebot/`. d_main.py and w_main.py updated. Bots restarted 01:33 UTC 2026-04-10.
-- **Constants (all env-overridable):** `MIN_EV_THRESHOLD=0.04`, `EV_WINDOW_TIMEOUT=90`, `EV_POLL_INTERVAL=5`, `EV_CONF_BOOST=0.5`, `PAYOUT_RATE=0.99`, `MIN_WHALE_ENTRY=0.52`
-- **Early results:** D2 blocking ~15% of signals with `low_ev` (74/500); W gate not yet triggered (20min uptime)
-
-#### Sixth Session Performance (pre-EV gate, ~22:00–01:33 UTC)
-- D2: 22 trades, 40.9% WR, -$14.93 (gated to DOGE Up only — BTC/ETH/XRP blocked by BiasTracker/quality_floor)
-- W: 90 trades, 51.1% WR, -$35.65 (entering too many low-price markets with no drift advantage)
-- Force-settled 7 stuck positions at end of pre-EV session
-
----
-
-> Older sessions: see SESSIONS.md
+> Session logs: [SESSIONS.md](https://github.com/SierraNevadapng/polymarket-bot/blob/main/SESSIONS.md)
 
 
 
