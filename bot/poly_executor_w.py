@@ -736,6 +736,8 @@ class PolyExecutor:
 
                     amount=contracts,
 
+                    side="BUY",
+
                     price=max_price,
 
                     order_type=OrderType.FOK,
