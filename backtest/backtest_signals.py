@@ -101,9 +101,8 @@ async def fetch_s3(client: httpx.AsyncClient, asset: str, entry_ts: float) -> tu
     try:
         resp = await client.get(
             f"{OKX_API}/funding-rate-history",
-            params={"instId": f"{asset}-USD-SWAP",
-                    "before": str(int(entry_ts * 1000)),
-                    "after":  str(int((entry_ts - 3600) * 1000)),
+            params={"instId": f"{asset}-USDT-SWAP",
+                    "after":  str(int(entry_ts * 1000)),
                     "limit":  "1"},
         )
         records = resp.json().get("data", [])
@@ -119,7 +118,7 @@ async def fetch_s4(client: httpx.AsyncClient, asset: str, entry_ts: float) -> tu
     try:
         resp = await client.get(
             f"{OKX_API}/liquidation-orders",
-            params={"instType": "SWAP", "instId": f"{asset}-USDT-SWAP",
+            params={"instType": "SWAP", "instFamily": f"{asset}-USD", "state": "filled",
                     "before": str(int(entry_ts * 1000)),
                     "after":  str(int((entry_ts - 300) * 1000))},
         )
@@ -205,7 +204,7 @@ async def process_batch(client: httpx.AsyncClient, batch: list[dict], out_file):
 
 async def main(markets_path: Path, out_path: Path):
     markets = [json.loads(l) for l in markets_path.read_text(encoding="utf-8").splitlines() if l.strip()]
-    print(f"Processing {len(markets)} markets → {out_path}")
+    print(f"Processing {len(markets)} markets -> {out_path}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     written = 0

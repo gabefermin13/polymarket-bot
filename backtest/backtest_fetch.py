@@ -12,11 +12,17 @@ ASSETS = {"BTC", "ETH", "DOGE"}
 MIN_MARKETS = 300
 
 
+ASSET_KEYWORDS = {
+    "BTC":  ["BTC", "BITCOIN"],
+    "ETH":  ["ETH", "ETHEREUM"],
+    "DOGE": ["DOGE", "DOGECOIN"],
+}
+
 def parse_asset(question: str) -> str | None:
     q = question.upper()
-    for a in ASSETS:
-        if a in q:
-            return a
+    for asset, keywords in ASSET_KEYWORDS.items():
+        if any(k in q for k in keywords):
+            return asset
     return None
 
 
@@ -69,7 +75,8 @@ async def fetch_markets(out_path: Path) -> int:
         with open(out_path, "w", encoding="utf-8") as f:
             while True:
                 resp = await client.get(f"{GAMMA_API}/markets",
-                    params={"closed": "true", "limit": 100, "offset": offset})
+                    params={"closed": "true", "limit": 100, "offset": offset,
+                            "end_date_min": "2024-01-01"})
                 resp.raise_for_status()
                 markets = resp.json()
                 if not markets:
@@ -121,7 +128,7 @@ async def fetch_markets(out_path: Path) -> int:
 
 
 async def main(out_path: Path):
-    print(f"Fetching resolved markets → {out_path}")
+    print(f"Fetching resolved markets -> {out_path}")
     t0 = time.time()
     n = await fetch_markets(out_path)
     print(f"Written {n} markets in {time.time()-t0:.1f}s")

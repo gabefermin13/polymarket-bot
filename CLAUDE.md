@@ -310,6 +310,17 @@ TELEGRAM_CHAT_ID=6400219232
 **NOTE:** Whalebot S6 (Polymarket CLOB flow) confirmed active — used in two ways: (1) ThresholdEngine calls S6 with `signal.token_id` (whale's actual position token) to adjust CCC threshold ±0.04 per signal; (2) CLOB bid/ask veto gate (CLOB_VETO_RATIO=20.0) hard-blocks extreme imbalance. Both live.
 **NOTE:** D2 time-zone gate added 2026-04-09 (fifth session) — `_DEAD_HOURS={11,12}` skip entirely; `_STRICT_HOURS={6,7,8,13,15,16,17}` require n≥3.0 AND conf≥0.70; `_PEAK_HOURS={9,10,14,18,19,20,21}` apply Kelly×1.2 boost. `BASE_MIN_CONF` raised 0.55→0.65. Zone shown in Telegram entry (`zone=peak/strict/standard`).
 **NOTE:** D2 ASSETS expanded to include XRP 2026-04-09 (fifth session) — `ASSETS = ["BTC", "ETH", "DOGE", "XRP"]`. Added `"XRP": "XXRPZUSD"` to `_KRAKEN_PAIRS` in `direction_signals.py` (S9 Coinbase premium). S8 NEUTRAL for XRP (Deribit no XRP options). All other signals work.
+**NOTE:** D2 ETH removed from ASSETS 2026-04-11 (eleventh session) — 130-trade analysis showed ETH Up 33% WR, ETH Down 31% WR across both bots. Now `ASSETS = ["BTC", "DOGE", "XRP"]`. ETH had zero positive alpha.
+**NOTE:** W-bot combo blocks added 2026-04-11 (eleventh session) — `_BLOCKED_COMBOS = {("ETH","Up"),("ETH","Down"),("BTC","Up")}` inserted in `on_whale_trade()` after `asset = signal.symbol.split("-")[0]`. ETH both dirs: 31-33% WR across 25 trades. BTC Up: 30% WR across 20 trades. Logged as `combo_blocked`.
+**NOTE:** Combo-tier Kelly multiplier added to D2 and W 2026-04-11 (eleventh session) — data-driven sizing by observed WR tier. `_COMBO_KELLY_TIERS = {("BTC","Down"):1.3, ("XRP","Down"):1.0, ("DOGE","Up"):1.0, ("XRP","Up"):1.0}`, default=0.8. All env-overridable via `TIER_KELLY_BTC_DOWN`, `TIER_KELLY_DEFAULT`, etc. Tier multiplier sits inside the Kelly chain (after ML kelly_scale, before Kronos/EV multipliers); poly_executor still applies MAX_KELLY_FRACTION cap and correlation discount on top.
+**NOTE:** D2 ML_MIN_BTC_UP raised 0.85→0.99 2026-04-11 (eleventh session) — effectively blocks BTC Up on D2 (no ML model returns p≥0.99). Cleaner than removing from ASSETS (preserves signal logging).
+**NOTE:** Dashboard balance chart fixed 2026-04-11 (eleventh session) — `_balance_history()` rewritten: uses close events only, delta=realized_pnl (not cost+pnl), starts from `initial_balance` in bankroll.json (not hardcoded 107). Chart ends at ~$163 = $97.28 + $65.86 realized P&L (accurate per positions.jsonl). bankroll.json ($128.84) is stale — only updated by force_settle, not normal bot ops.
+**NOTE:** Dashboard three-way balance breakdown added 2026-04-11 (eleventh session) — `_compute_balances()`: total = initial + realized_pnl; deployed = sum of open position costs; liquid = total − deployed. Hero now shows 5 cells: Total Balance, Liquid Cash, Deployed, P&L, Win Rate. CSS: `grid-template-columns: repeat(5, 1fr)`.
+**NOTE:** Dashboard chart timezone changed to America/Los_Angeles 2026-04-11 (eleventh session).
+**NOTE:** Dashboard restart requires uvicorn — `pkill -f "uvicorn dashboard"` then `uvicorn dashboard:app --host 0.0.0.0 --port 8080`. Not `python3 dashboard.py`.
+**NOTE:** 130-trade analysis 2026-04-11 (eleventh session) — BTC Down 77% WR +$69.73 is carrying all profits. ETH Up/Down and BTC Up are systematically negative. W:L ratio 1.14x (structural: avg entry ~$0.50 gives natural 1.0x ratio). Path to 1.3-1.5x W:L: combo cleanup first, then ML/EV quality improvement.
+**NOTE:** ML backfill expanded to 164,094 markets 2026-04-11 (eleventh session) — `training_data.jsonl` complete, 0 errors. Ready for retraining model v6 (v5 was trained on 95K markets).
+**NOTE:** MAX_MARKET_SECS_LEFT=900 confirmed working in D2 2026-04-11 (eleventh session) — gate at line 7744, 12-space indent inside `_scan_once()` try block. `continue` correctly skips to next `for asset in ASSETS:` iteration. All log violations were from before investigation window.
 **NOTE:** W-bot BiasTracker replaced with WalletCooldown 2026-04-09 (fifth session) — BiasTracker was blocking 68% of all W signals (per-combo; if DOGE Up had a bad run, ALL DOGE Up blocked). Replaced with per-wallet streak: 3 consecutive losses → 45-min cooldown for that wallet. Much lighter gate.
 **NOTE:** W-bot S1-S10 directional filter added 2026-04-09 (fifth session) — After CCC threshold check, calls `DirectionConsensus.evaluate()`. If signals agree with whale direction and n≥DIR_BOOST_N (2.0) → conf +0.05. If signals oppose and n≥DIR_VETO_N (2.0) → veto (`dir_signal_veto`). Cached via ThresholdEngine (no duplicate API calls). Entry Telegram shows `dir=+X.X` or `dir=-X.X`.
 **NOTE:** W-bot whale pool expanded 95%+ WR 2026-04-09 (fifth session) — `W_WR_MIN` lowered 99→95, cap removed (`W_POOL_CAP=500`). scan16 found 374 wallets 95%+ WR; 240+ written to whale_pool.json. W pool updated every 20 new wallets (not just at C3 trigger).
@@ -531,10 +542,37 @@ nohup python3 d_main.py >> logs_d3/bot.log 2>&1 &
 - ~~**D2 missing/unsettled positions**~~ — FIXED 2026-04-09 (fifth session). 9 expired DOGE Up positions failed to settle due to DNS failure on VPS. Force-settled 6 using httpx + direct jsonl write; 7th settled naturally. Bankroll $60.86→$89.40.
 - **scan16 W pool may be stale** — runs every 6h via cron; between scans the pool only grows if manually triggered. Monitor pool size in watchdog logs.
 - ~~**XRP not in D2 ASSETS**~~ — ADDED 2026-04-09 (fifth session). `ASSETS = ["BTC", "ETH", "DOGE", "XRP"]`. direction_signals.py updated with Kraken pair XXRPZUSD.
+- ~~**Dashboard balance chart inaccurate**~~ — FIXED 2026-04-11 (eleventh session). `_balance_history()` uses close events only, delta=realized_pnl, starts from bankroll.json initial_balance. Three-way breakdown added: Total/Liquid/Deployed.
+- ~~**ETH dragging WR**~~ — BLOCKED 2026-04-11 (eleventh session). ETH removed from D2 ASSETS; ETH Up+Down added to W-bot `_BLOCKED_COMBOS`. BTC Up also blocked on W.
+- **Model v6 not yet trained** — training_data.jsonl expanded to 164,094 markets (was 95K for v5). Run ml_train.py to produce v6. ml_calibrate.py cron will continue hot-reloading.
 
 ---
 
 > Older session logs archived to [SESSIONS.md](https://github.com/SierraNevadapng/polymarket-bot/blob/main/SESSIONS.md)
+
+## Session Status (last updated 2026-04-11 UTC — eleventh session)
+
+### Completed This Session — 2026-04-11 (eleventh session)
+
+#### Combo Cleanup — D2 + W
+- **130-trade analysis:** BTC Down 77% WR +$69.73 is the sole profit driver. ETH Up/Down 31-33% WR, BTC Up 30% WR — all systematically negative.
+- **D2:** ETH removed from `ASSETS`. Now `["BTC", "DOGE", "XRP"]`. `ML_MIN_BTC_UP=0.99` effectively blocks BTC Up.
+- **W:** `_BLOCKED_COMBOS = {("ETH","Up"),("ETH","Down"),("BTC","Up")}` added to `on_whale_trade()`.
+- **Combo-tier Kelly multiplier** on both bots: BTC Down=1.3×, XRP Down/DOGE Up/XRP Up=1.0×, default=0.8×. Env-overridable `TIER_KELLY_*` vars.
+- **W:L ratio:** 1.14× structural (driven by ~$0.50 avg entry price). Path to 1.3-1.5×: combo cleanup first, then ML/EV quality improvement.
+
+#### Dashboard Fixes
+- `_balance_history()`: close events only, delta=realized_pnl, starts from bankroll.json `initial_balance`.
+- `_compute_balances()`: total/liquid/deployed three-way breakdown.
+- Hero: 5 cells — Total Balance, Liquid Cash, Deployed, P&L, Win Rate.
+- Chart timezone: America/Los_Angeles.
+- Stale `setEl('h-open', ...)` / `setEl('h-locked', ...)` calls removed from `loadOpenPositions()`.
+
+#### ML Backfill Expanded
+- ml_backfill.py completed on 164,094 markets (expanded from 91K). `training_data.jsonl` ready.
+- Model v6 retrain pending — run `ml_train.py` on new dataset.
+
+---
 
 ## Session Status (last updated 2026-04-10 UTC — eighth session)
 
@@ -759,6 +797,12 @@ pos, _ = await executor.execute(..., kelly_multiplier=adj_kelly * score.kelly_sc
 | drift_ev.py resolution tightening (minute-align + Binance fallback) | DONE (tenth session) |
 | Kelly correlation adjustment (corr matrix, _corr_discount()) | DONE (tenth session) |
 | 24-48h paper validation with full stack → go live | CURRENT |
+| 130-trade analysis: block ETH both dirs + BTC Up, tier Kelly (BTC Down 1.3×, default 0.8×) | DONE 2026-04-11 (eleventh session) |
+| Dashboard balance chart accuracy fix (close-events only, bankroll.json initial, LA timezone) | DONE 2026-04-11 (eleventh session) |
+| Dashboard three-way balance: Total/Liquid/Deployed | DONE 2026-04-11 (eleventh session) |
+| ML backfill expanded to 164,094 markets → training_data.jsonl | DONE 2026-04-11 (eleventh session) |
+| Train model v6 on 164K-market dataset | pending |
+| Monitor 50-100 trades post-combo-cleanup — confirm W:L moves toward 1.3×+ | CURRENT |
 | Go live (PAPER_TRADING=0, D2 + W .env restart) | next |
 | Tabled for next week (need data): #3 hist patterns, #8 CLOB taker/maker, #10 VWAP, #11 funding extremes, #12 heatmap, #13 mean reversion | pending |
 
