@@ -1,0 +1,126 @@
+{
+  "trained_at": 1775891821.5127435,
+  "n_samples": 95408,
+  "win_rate": 0.5,
+  "cv_auc": 0.7738655079888189,
+  "cv_auc_std": 0.0032823574743737604,
+  "cv_brier": 0.18901755511760712,
+  "threshold": 0.70,
+  "feature_cols": [
+    "ask_price",
+    "hour_utc",
+    "minute_utc",
+    "day_of_week",
+    "duration_secs",
+    "s1_momentum",
+    "s1_conf",
+    "s3_funding",
+    "s3_conf",
+    "bn_momentum_1m",
+    "bn_momentum_5m",
+    "bn_momentum_15m",
+    "bn_momentum_30m",
+    "bn_momentum_60m",
+    "bn_volume_ratio",
+    "realized_vol_30m",
+    "price_vs_ma20",
+    "price_vs_ma60",
+    "drift_pct",
+    "drift_signed",
+    "ev",
+    "p_win",
+    "symbol_BTC",
+    "symbol_ETH",
+    "symbol_DOGE",
+    "symbol_XRP",
+    "direction_Up",
+    "direction_Down",
+    "combo_BTC_Up",
+    "combo_BTC_Down",
+    "combo_ETH_Up",
+    "combo_ETH_Down",
+    "combo_DOGE_Up",
+    "combo_DOGE_Down",
+    "combo_XRP_Up",
+    "combo_XRP_Down",
+    "mom_agreement",
+    "mom_consistency",
+    "is_peak_hour",
+    "is_dead_hour",
+    "is_strict_hour",
+    "ev_x_duration",
+    "cheap_entry"
+  ],
+  "top_features": [
+    [
+      "duration_secs",
+      0.33994245529174805
+    ],
+    [
+      "minute_utc",
+      0.22775596380233765
+    ],
+    [
+      "bn_momentum_60m",
+      0.08030039072036743
+    ],
+    [
+      "bn_momentum_1m",
+      0.03155834227800369
+    ],
+    [
+      "price_vs_ma60",
+      0.024112358689308167
+    ],
+    [
+      "hour_utc",
+      0.013462191447615623
+    ],
+    [
+      "ev_x_duration",
+      0.011600760743021965
+    ],
+    [
+      "price_vs_ma20",
+      0.011240940541028976
+    ],
+    [
+      "is_strict_hour",
+      0.011078531853854656
+    ],
+    [
+      "realized_vol_30m",
+      0.011022976599633694
+    ],
+    [
+      "bn_momentum_30m",
+      0.01014758087694645
+    ],
+    [
+      "is_dead_hour",
+      0.009903909638524055
+    ],
+    [
+      "combo_XRP_Down",
+      0.009503976441919804
+    ],
+    [
+      "day_of_week",
+      0.009373812936246395
+    ],
+    [
+      "bn_momentum_15m",
+      0.009045535698533058
+    ]
+  ],
+  "symbol_counts": {
+    "BTC": 35116,
+    "ETH": 34144,
+    "XRP": 26106,
+    "DOGE": 42
+  },
+  "direction_counts": {
+    "Up": 47704,
+    "Down": 47704
+  }
+}
