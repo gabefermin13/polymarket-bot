@@ -5,7 +5,10 @@ Deploy: /root/dashboard.py
 Run: nohup uvicorn dashboard:app --host 0.0.0.0 --port 8080 > /tmp/dashboard.log 2>&1 &
 """
 
+import asyncio
+import fcntl
 import json
+import logging
 import os
 import signal as _signal
 import subprocess
@@ -16,6 +19,8 @@ from typing import Optional
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
+
+logger = logging.getLogger("dashboard")
 
 app = FastAPI(title="Polymarket Bot Dashboard")
 
@@ -59,6 +64,168 @@ BOT_PAUSE_FLAGS = {
 
 _regime_cache: dict = {"data": None, "ts": 0.0}
 REGIME_TTL = 300
+
+# ── Live Polymarket account tracking ──────────────────────────────────────────
+# Actual maker address (resolved via getPolyProxyWalletAddress from EOA)
+MAKER_ADDRESS        = os.getenv("POLYMARKET_ADDRESS_MAKER", "0xEf5750e0787C23e7540110ca54D1e098bdC4C9DF")
+POLYGON_RPC_URL      = "https://polygon-bor-rpc.publicnode.com"
+USDC_CONTRACT        = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+ACTIVITY_URL         = "https://data-api.polymarket.com/activity"
+
+_live_balance_cache: dict = {"ts": 0.0, "balance": None}
+LIVE_BALANCE_TTL = 60   # seconds between on-chain RPC calls
+
+# ── Live on-chain helpers ─────────────────────────────────────────────────────
+
+async def _fetch_live_usdc_balance() -> Optional[float]:
+    """Query Polygon RPC for USDC balance of the actual maker address."""
+    now = time.time()
+    if now - _live_balance_cache["ts"] < LIVE_BALANCE_TTL and _live_balance_cache["balance"] is not None:
+        return _live_balance_cache["balance"]
+    try:
+        padded  = MAKER_ADDRESS[2:].lower().zfill(64)
+        payload = {
+            "jsonrpc": "2.0", "method": "eth_call",
+            "params":  [{"to": USDC_CONTRACT, "data": "0x70a08231" + padded}, "latest"],
+            "id": 1,
+        }
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(POLYGON_RPC_URL, json=payload)
+            result  = r.json().get("result", "0x0")
+            balance = int(result, 16) / 1e6
+        _live_balance_cache["ts"]      = now
+        _live_balance_cache["balance"] = round(balance, 4)
+        return _live_balance_cache["balance"]
+    except Exception as e:
+        logger.warning(f"[live_balance] RPC failed: {e}")
+        return _live_balance_cache.get("balance")
+
+
+async def _reconcile_polymarket_activity() -> int:
+    """
+    Poll Polymarket activity API for MAKER_ADDRESS.
+    For every open position whose end_time has passed, check if a SELL/REDEEM
+    event exists and write a close event to positions.jsonl.
+    Returns number of positions settled.
+    """
+    settled = 0
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(ACTIVITY_URL, params={"user": MAKER_ADDRESS, "limit": 200})
+        if r.status_code != 200:
+            return 0
+        activity = r.json()
+    except Exception as e:
+        logger.warning(f"[reconcile] activity fetch failed: {e}")
+        return 0
+
+    # Index sells/redeems by token_id
+    sells: dict = {}
+    for ev in activity:
+        asset    = str(ev.get("asset", ""))
+        ev_type  = ev.get("type", "")
+        ev_side  = str(ev.get("side", "")).upper()
+        is_sell  = (ev_type == "TRADE" and ev_side == "SELL") or ev_type == "REDEEM"
+        if is_sell:
+            sells.setdefault(asset, []).append(ev)
+
+    now = time.time()
+
+    for bot_key, cfg in BOTS.items():
+        pos_file = cfg["positions"]
+        if not pos_file.exists():
+            continue
+
+        open_map:  dict = {}
+        close_ids: set  = set()
+        try:
+            with open(pos_file, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    pid = rec.get("id", "")
+                    if rec.get("event") == "open":
+                        open_map[pid] = rec
+                    elif rec.get("event") == "close":
+                        close_ids.add(pid)
+        except Exception:
+            continue
+
+        to_write = []
+        for pid, pos in open_map.items():
+            if pid in close_ids:
+                continue
+            end_time = float(pos.get("end_time", 0))
+            if end_time > now + 30:        # not yet expired
+                continue
+            token_id  = str(pos.get("token_id", ""))
+            ts_open   = float(pos.get("ts_open", 0))
+            cost_usd  = float(pos.get("cost_usd", 0))
+
+            relevant = [s for s in sells.get(token_id, [])
+                        if float(s.get("timestamp", 0)) >= ts_open - 5]
+
+            if relevant:
+                payout       = sum(float(s.get("usdcSize", 0)) for s in relevant)
+                ts_close     = max(float(s.get("timestamp", 0)) for s in relevant)
+                exit_ct      = sum(float(s.get("size", 0)) for s in relevant)
+                exit_price   = round(payout / exit_ct, 6) if exit_ct > 0 else 0.99
+                pnl          = round(payout - cost_usd, 4)
+                close_ev     = {**pos, "event": "close",
+                                "status": "won" if pnl > 0 else "lost",
+                                "exit_price": exit_price, "realized_pnl": pnl,
+                                "ts_close": ts_close, "source": "dashboard_reconcile"}
+            elif end_time > 0 and end_time < now - 300:
+                # 5 min past expiry, no sell found → expired worthless
+                close_ev = {**pos, "event": "close", "status": "lost",
+                            "exit_price": 0.0, "realized_pnl": round(-cost_usd, 4),
+                            "ts_close": end_time, "source": "dashboard_reconcile"}
+            else:
+                continue
+
+            to_write.append(close_ev)
+
+        if to_write:
+            lock_path = str(pos_file) + ".lock"
+            try:
+                with open(lock_path, "w") as lf:
+                    fcntl.flock(lf, fcntl.LOCK_EX)
+                    try:
+                        with open(pos_file, "a", encoding="utf-8") as f:
+                            for ev in to_write:
+                                f.write(json.dumps(ev) + "\n")
+                        settled += len(to_write)
+                        logger.info(f"[reconcile] {bot_key}: auto-settled {len(to_write)} positions")
+                    finally:
+                        fcntl.flock(lf, fcntl.LOCK_UN)
+            except Exception as e:
+                logger.error(f"[reconcile] write failed for {bot_key}: {e}")
+
+    return settled
+
+
+async def _reconcile_loop():
+    """Background task: reconcile open positions against Polymarket every 2 min."""
+    await asyncio.sleep(10)   # brief startup delay
+    while True:
+        try:
+            n = await _reconcile_polymarket_activity()
+            if n:
+                logger.info(f"[reconcile] settled {n} positions")
+        except Exception as e:
+            logger.error(f"[reconcile] loop error: {e}")
+        await asyncio.sleep(120)
+
+
+@app.on_event("startup")
+async def _startup():
+    asyncio.create_task(_reconcile_loop())
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -294,20 +461,22 @@ async def _fetch_regime() -> dict:
 
 @app.get("/api/status")
 async def api_status():
-    regime   = await _fetch_regime()
-    br       = _bankroll()
-    balances = _compute_balances()
-    d2       = _bot_stats("d2")
-    w        = _bot_stats("w")
+    regime       = await _fetch_regime()
+    br           = _bankroll()
+    balances     = _compute_balances()
+    d2           = _bot_stats("d2")
+    w            = _bot_stats("w")
+    live_balance = await _fetch_live_usdc_balance()
     return JSONResponse({
-        "ts":           int(time.time()),
-        "regime":       regime.get("regime", "Unknown"),
-        "regime_pct":   regime.get("pct_change"),
-        "btc_price":    regime.get("current_price"),
-        "bankroll":     br,
-        "balances":     balances,
-        "combined_pnl": round(d2["pnl"] + w["pnl"], 2),
-        "bots":         {"d2": d2, "w": w},
+        "ts":             int(time.time()),
+        "regime":         regime.get("regime", "Unknown"),
+        "regime_pct":     regime.get("pct_change"),
+        "btc_price":      regime.get("current_price"),
+        "bankroll":       br,
+        "balances":       balances,
+        "live_usdc":      live_balance,
+        "combined_pnl":   round(d2["pnl"] + w["pnl"], 2),
+        "bots":           {"d2": d2, "w": w},
     })
 
 
@@ -740,9 +909,9 @@ HTML = r"""<!DOCTYPE html>
   <!-- ── Account Overview ── -->
   <div class="hero">
     <div class="hero-cell">
-      <div class="hero-label">Total Balance</div>
+      <div class="hero-label">On-chain USDC <span style="font-size:9px;color:var(--green);margin-left:4px;">&#9679; LIVE</span></div>
       <div class="hero-value" id="h-balance">--</div>
-      <div class="hero-sub" id="h-balance-pnl">-- realized P&amp;L</div>
+      <div class="hero-sub" id="h-balance-pnl">-- tracked P&amp;L</div>
     </div>
     <div class="hero-cell">
       <div class="hero-label">Liquid Cash</div>
@@ -997,14 +1166,18 @@ async function loadStatus() {
     // Hero — balances
     const bal = data.balances;
     const balEl = document.getElementById('h-balance');
-    balEl.textContent = fmtUSD(bal.total);
-    const balPnl = bal.total - bal.initial;
+    // Primary balance: live on-chain USDC (authoritative); fall back to computed if unavailable
+    const liveUsdc = data.live_usdc;
+    balEl.textContent = liveUsdc != null ? fmtUSD(liveUsdc) : fmtUSD(bal.total);
+    const trackedPnl = bal.realized_pnl;
     const balPnlEl = document.getElementById('h-balance-pnl');
-    balPnlEl.textContent = fmtUSD(balPnl, true) + ' realized P\u0026L';
-    colorClass(balPnl, balPnlEl);
+    balPnlEl.textContent = fmtUSD(trackedPnl, true) + ' tracked P\u0026L';
+    colorClass(trackedPnl, balPnlEl);
 
     const liqEl = document.getElementById('h-liquid');
-    liqEl.textContent = fmtUSD(bal.liquid);
+    // Liquid = on-chain balance minus deployed
+    const liveBalance = liveUsdc != null ? liveUsdc : bal.total;
+    liqEl.textContent = fmtUSD(Math.max(0, liveBalance - bal.deployed));
 
     const depEl = document.getElementById('h-deployed');
     depEl.textContent = fmtUSD(bal.deployed);
@@ -1017,7 +1190,8 @@ async function loadStatus() {
     pnlEl.textContent = fmtUSD(pnl, true);
     colorClass(pnl, pnlEl);
 
-    const pct = bal.initial > 0 ? (balPnl / bal.initial * 100) : 0;
+    const totalGain = liveBalance - bal.initial;
+    const pct = bal.initial > 0 ? (totalGain / bal.initial * 100) : 0;
     setEl('h-pnl-pct', fmtPct(pct) + ' since inception');
 
     const totalTrades = d2.total_closed + w.total_closed;

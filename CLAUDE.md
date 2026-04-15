@@ -1,3 +1,42 @@
+## Strict Operating Rules — Follow Without Exception
+
+### Scope
+- Do ONLY what was explicitly asked. Nothing more, ever.
+- No "while I'm here" fixes, cleanups, or improvements
+- No refactoring code that wasn't mentioned
+- No touching files that aren't directly related to the task
+
+### Communication
+- No preamble. No "I'll now proceed to..." — just act.
+- No explaining what you're about to do before doing it
+- No summarizing what you just did unless asked
+- If something is unclear, ask ONE specific question. Then stop and wait.
+
+### Execution
+- One task at a time. Complete it, then stop.
+- Do not chain tasks unless explicitly told to
+- Do not run commands beyond what the task requires
+- If you hit something unexpected, stop and report. Do not improvise.
+
+### Token Discipline
+- Be concise in all responses
+- No padding, no filler, no reassurances
+- Code comments only where genuinely necessary
+- No walls of explanation after completing a task
+
+### Confirmation Gates
+- After completing a task, say "Done." and wait
+- Do not proceed to the next logical step without being told to
+- Do not assume approval to continue
+
+### Additional/Supplementary Ideas
+- If you have ANY idea for an extra, supplementary, or additional task — no matter how small, obvious, or beneficial it seems — you MUST stop and ask for confirmation before acting on it
+- This applies every single time, with no exceptions
+- Do not frame suggestions as part of the current task to bypass this rule
+- The format must be: "Suggestion: [what you want to do]. Proceed?" — then wait for a yes/no
+
+---
+
 # Polymarket Whale Copy-Trading Bot
 
 ## Working Style
@@ -11,6 +50,7 @@ A whale copy-trading + directional signal system for Polymarket Up-or-Down marke
 **Core insight:** Certain Polymarket wallets win 80-100% of their Up-or-Down trades over hundreds of markets. By monitoring their on-chain Polygon activity in real time and requiring N whales to agree (consensus filter), we copy only their highest-conviction signals.
 
 **Current mode:** LIVE — real orders on Polymarket CLOB. Gone live 2026-04-12. Shared bankroll at `/root/shared_bankroll.json`. Starting bankroll $97.28; balance as of go-live: $279.20.
+**Current balance (2026-04-15):** ~$45.13 (verified on-chain). Both D2 and W running LIVE. D2: PASS2_N_REQUIRED=0.5, ML as primary gate. W: QM_PRIOR_ALPHA=10, quality_model.json cleared.
 
 ---
 
@@ -329,6 +369,17 @@ TELEGRAM_CHAT_ID=6400219232
 **NOTE:** Per-asset open position cap added to D2 d_main.py 2026-04-12 — `MAX_XRP_POSITIONS=2`, `MAX_ASSET_POSITIONS=3` env vars. Gate inserted after combo_min_conf check. Skip reason: `asset_open_cap`.
 **NOTE:** 30¢ YES→Down flip added to D2 d_main.py 2026-04-12 (Step 2) — if direction="Up" and `_ev.ask < 0.30`, flip to "Down" market and re-run EV. Only executes if a Down market exists.
 **NOTE:** MarketOrderArgs missing `side` arg fixed 2026-04-12 — `poly_executor.py` called `MarketOrderArgs(token_id, amount, price, order_type)` but the signature requires `side` as the 3rd positional arg. Every live order since go-live failed silently with `live_execution_failed`. Fixed: `side="BUY"` added. Both D2 and W poly_executor.py patched.
+**NOTE:** Fourteenth session (2026-04-15) — Codex had fixed live trading (invalid signature resolved). Bot made 24 on-chain trades from $97.28, depleting wallet to $44. Root causes: (1) `live_execution_failed` reconciliation bug — activity API lookup used wrong address initially, and 20s poll window too short for API indexing lag; (2) iProyal proxy drops connection mid-order, causing `PolyApiException[Request exception!]` AFTER the order already submitted and filled on-chain. Both failure modes result in real fills with no position tracked and bankroll not decremented. (3) D2 pass-2 IC-weighted score vs pass-1 unweighted count inconsistency — D2 was executing only 5 trades from 3454 signals (CONSENSUS_REQUIRED=2 but IC-weighted n_for_dir maxing at 0.5 due to S2 contrarian subtracting when it agrees).
+**NOTE:** New modules deployed by Codex (now on VPS and GitHub): `choppiness_gate.py` (global BTC intrabar range gate), `quality_model.py` (Thompson Sampling per-entity Beta distribution), `kronos_signal.py` (Kronos ML price forecast → Kelly multiplier). Kronos endpoint IS live on Frankfurt proxy at `/kronos/{symbol}` — fetches 100 1-min klines, runs `NeoQuasar/Kronos-mini`, returns `{direction, vol_daily, drift_pct}`. Was failing due to cold-start timeout (12s default). Fixed: `KRONOS_TIMEOUT=45` added to both .env files.
+**NOTE:** Reconciliation fix deployed 2026-04-15 — `_await_live_trade_data()` timeout raised 20s→60s, removed `stable` double-confirmation requirement, added fast-path for `matchedOrders`/`fills` in CLOB result. Post-exception rescue added 2026-04-15: if `_place()` throws (proxy drops after submit), catches exception, waits 5s, then calls `_await_live_trade_data()` with 30s timeout to recover the fill. Fills recovered via rescue are logged as `tx_hash=rescue_ok`. Both W and D2 poly_executor.py.
+**NOTE:** D2 pass-2 fix deployed 2026-04-15 — added `PASS2_N_REQUIRED = float(os.getenv("PASS2_N_REQUIRED", str(max(1.0, CONSENSUS_REQUIRED - 1.0))))`. Pass-1 still uses integer CONSENSUS_REQUIRED. Pass-2 uses PASS2_N_REQUIRED (default 1.0 for CONSENSUS_REQUIRED=2). Set `PASS2_N_REQUIRED=1.0` in D2 .env. This allows trades when S11=1.0 fires alone, or S3=1.5, or any combination reaching 1.0 weighted.
+**NOTE:** Dashboard live balance tracking added 2026-04-15 (fifteenth session) — dashboard.py now fetches on-chain USDC balance via Polygon RPC eth_call (`balanceOf` on USDC contract for maker address `0xEf5750e0787C23e7540110ca54D1e098bdC4C9DF`), 60s TTL cache. Background `_reconcile_loop()` runs every 120s: polls Polymarket activity API, writes close events for expired positions (won if SELL/REDEEM found, lost if 5+ min past expiry with no activity). Hero shows "On-chain USDC ● LIVE" as primary balance. Liquid = live_balance − deployed.
+**NOTE:** W QM_PRIOR_ALPHA raised to 10 (2026-04-15, fifteenth session) — root cause of `below_min_dollars`: stale quality_model.json (pre-populated by Codex with quality=0.416 for many wallets, all n=0). Combined Kelly chain: base×0.60(EV)×0.50(ML)×0.416(QM)×1.30(tier) = 0.92/ask < $1.00. Fix: `QM_PRIOR_ALPHA=10` in W .env → prior_quality=10/11.5=0.870. Also cleared quality_model.json to `{}` so all wallets start fresh from new prior (old JSON had junk pre-populated scores not from live trades). Combined chain now produces $2.30+ positions.
+**NOTE:** D2 PASS2_N_REQUIRED lowered 1.0→0.5 (2026-04-15, fifteenth session) — root cause of D2 undertrading (5 executions from 656 evaluated signals): S3/S4/S5/S7 all return NEUTRAL/NONE/FLAT in ranging markets, leaving only S2 (contrarian, weight=-0.5) and S11 (weight=1.0). IC-weighted pass-2 score = 1.0−0.5 = 0.5 < PASS2_N_REQUIRED=1.0 → 410/656 signals blocked by `below_threshold_after_s6`. Fix: `PASS2_N_REQUIRED=0.5` in D2 .env. ML gate is now primary quality filter. Pass-1 still requires 2 raw signals to agree on direction.
+**NOTE:** Actual maker address is `0xEf5750e0787C23e7540110ca54D1e098bdC4C9DF` — this is `builder.funder` as resolved by `_resolve_proxy_funder()` (eth_call `getPolyProxyWalletAddress(EOA)` on CTF Exchange). Polymarket activity API indexes trades under this address, NOT under `POLYMARKET_ADDRESS` (`0xaeA2bb57...`). `_live_owner()` correctly returns `builder.funder` when client is initialized.
+**NOTE:** iProyal proxy `_lifetime-30m` removed 2026-04-13 — session rotation parameter was killing in-flight order submissions (~20s timeout, `status_code=None`). Removed from `CLOB_PROXY_URL` in both D2 and W `.env`. Verified: HTTP 200 in 1.23s after fix.
+**NOTE:** `invalid signature` root cause identified 2026-04-13 (thirteenth session) — after proxy fix, all orders return `status_code=400, {'error': 'invalid signature'}`. Ruled out: (1) neg_risk/wrong exchange — confirmed `neg_risk=False`, `py_clob_client` selects correct verifyingContract `0x4bFb41d5...` via `get_neg_risk(token_id)` at runtime. (2) EIP-712 domain construction — correct. Most likely cause: EOA (`0xcECEEb57accF34ED2e21D25d6C2037F6109751f0`) not registered as approved operator for proxy wallet (`0xaeA2bb57baF02E5148C478a7d7D5dBF851ceA7Ae`) on CTF Exchange contract on Polygon. Check via `isRegisteredOperator(proxy_wallet, EOA)` on `0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E`. NOTE: earlier "orderbook does not exist" test did NOT prove signature validity — Polymarket checks orderbook existence before signature validation. Handed off to Codex/ChatGPT for resolution.
+**NOTE:** GitHub backup completed 2026-04-13 — full bot source pushed to `SierraNevadapng/polymarket-bot` main branch. Structure: `bot/whalebot/` (19 files), `bot/dbot_d2/` (16 files), `bot/shared/` (6 files), `bot/CLAUDE.md`. ~25K unique lines of code. `.gitignore` added for `*.tmp`, `xml_file*.xml`.
 **NOTE:** ML per-combo boost+floor override added to W w_main.py 2026-04-12 — after `_ml.should_trade()` fails, checks `ML_BOOST_{ASSET}_{DIR}` (additive boost to p_win) and `ML_MIN_{ASSET}_{DIR}` (lowered floor). `ML_BOOST_BTC_DOWN=0.15` + `ML_MIN_BTC_DOWN=0.55` in W .env — BTC Down (77% WR best combo) was being blocked at p=0.41 by ML v5 threshold of 0.70. Boosted: 0.41+0.15=0.56 >= 0.55 → passes. Not a full bypass — still requires boosted p_win to clear the lowered floor.
 **NOTE:** MAX_MARKET_SECS_LEFT=900 confirmed working in D2 2026-04-11 (eleventh session) — gate at line 7744, 12-space indent inside `_scan_once()` try block. `continue` correctly skips to next `for asset in ASSETS:` iteration. All log violations were from before investigation window.
 **NOTE:** W-bot BiasTracker replaced with WalletCooldown 2026-04-09 (fifth session) — BiasTracker was blocking 68% of all W signals (per-combo; if DOGE Up had a bad run, ALL DOGE Up blocked). Replaced with per-wallet streak: 3 consecutive losses → 45-min cooldown for that wallet. Much lighter gate.
@@ -571,7 +622,7 @@ nohup python3 d_main.py >> logs_d3/bot.log 2>&1 &
 - **Initialized:** $107.00 on 2026-04-07
 - **Flow (W — correct):** open → deduct cost_usd; settle → credit contracts × exit_price
 - **Flow (D-bots):** open → deducts cost_usd (bug was fixed in prior session); settle → credit contracts × exit_price
-- **Current value:** ~$47.21 — sixth session (pre-EV-gate losses; EV gate deployed 2026-04-10 01:09 UTC).
+- **Current value:** $45.128 (verified 2026-04-15 against on-chain maker USDC balance via Polygon RPC). Matches shared_bankroll.json exactly.
 
 ---
 
@@ -645,7 +696,14 @@ nohup python3 d_main.py >> logs_d3/bot.log 2>&1 &
 | ML backfill expanded to 164,094 markets → training_data.jsonl | DONE 2026-04-11 (eleventh session) |
 | Train model v6 on 164K-market dataset | pending |
 | Monitor 50-100 trades post-combo-cleanup — confirm W:L moves toward 1.3×+ | CURRENT |
-| Go live (PAPER_TRADING=0, D2 + W .env restart) | next |
+| Go live (PAPER_TRADING=0, D2 + W .env restart) | DONE 2026-04-12 |
+| Codex session: fix invalid signature, deploy ChoppinessGate/QualityModel/KronosSignal, live trades working | DONE 2026-04-13–14 |
+| Fourteenth session: reconciliation fix (60s timeout), Kronos timeout fix, D2 PASS2_N_REQUIRED, bankroll reset to $44 | DONE 2026-04-15 |
+| Fix remaining reconciliation gap: post-exception activity rescue (when _place() throws, still check activity API) | DONE 2026-04-15 |
+| Verify bankroll matches actual wallet after pending DOGE Up position resolves | DONE 2026-04-15 — $45.128 matches on-chain |
+| Push fourteenth session fixes to GitHub | DONE 2026-04-15 |
+| Fifteenth session: dashboard live USDC balance (Polygon RPC), reconciliation loop, W QM_PRIOR_ALPHA=10 + quality_model.json cleared, D2 PASS2_N_REQUIRED 1.0→0.5 | DONE 2026-04-15 |
+| Accumulate 50+ live settled trades for ML retraining calibration | CURRENT |
 | Tabled for next week (need data): #3 hist patterns, #8 CLOB taker/maker, #10 VWAP, #11 funding extremes, #12 heatmap, #13 mean reversion | pending |
 
 Spec files: `/root/polybot_backup/spec_d1_d6_consensus_system.md`, `spec_directional_wallet_scanner.md`

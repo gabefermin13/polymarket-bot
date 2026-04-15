@@ -23,6 +23,7 @@ import logging
 import os
 
 import time
+from decimal import Decimal, ROUND_HALF_UP
 
 from dataclasses import dataclass, field, asdict
 
@@ -71,6 +72,9 @@ MAX_ENTRY_PRICE      = float(os.getenv("MAX_ENTRY_PRICE", "1.0"))   # cap high-r
 # Fee estimate (Polymarket CLOB taker fee ≈ 1%)
 
 TAKER_FEE = 0.01
+
+POLY_CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
+POLY_SIGNATURE_TYPE = 1
 
 
 
@@ -126,7 +130,7 @@ class Position:
 
     confidence:   float
 
-    contracts:    int
+    contracts:    float
 
     entry_price:  float        # decimal (0.0–1.0)
 
@@ -169,6 +173,7 @@ class PolyExecutor:
         self.paper_mode  = paper_mode
 
         self._positions: dict[str, Position] = {}   # id → Position
+        self._settle_skip_log_ts: dict[tuple[str, str], float] = {}
 
         self._http = httpx.AsyncClient(timeout=20.0)
 
@@ -181,6 +186,7 @@ class PolyExecutor:
         if not paper_mode:
 
             self._init_live_client()
+            self._sync_shared_bankroll_to_wallet()
 
 
 
@@ -208,6 +214,8 @@ class PolyExecutor:
             for pid, d in seen_ids.items():
                 if d.get("event") == "open" and d.get("status") == "open":
                     end_time = d.get("end_time", 0)
+                    if end_time and end_time + 30 < now:
+                        continue
                     pos = Position(
                         id           = pid,
                         condition_id = d.get("condition_id", ""),
@@ -230,6 +238,220 @@ class PolyExecutor:
         if loaded:
             logger.info(f"Reloaded {loaded} open positions from disk")
 
+    def _get_live_wallet_usdc_balance(self) -> Optional[float]:
+        owner = self._live_owner()
+        if not owner:
+            return None
+        usdc = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        call_data = "0x70a08231" + owner.lower().replace("0x", "").rjust(64, "0")
+        rpc_urls = [
+            os.getenv("POLYGON_RPC_URL", ""),
+            os.getenv("RPC_URL", ""),
+            "https://polygon-bor-rpc.publicnode.com",
+        ]
+        for rpc_url in rpc_urls:
+            if not rpc_url:
+                continue
+            try:
+                resp = httpx.post(
+                    rpc_url,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "eth_call",
+                        "params": [
+                            {"to": usdc, "data": call_data},
+                            "latest",
+                        ],
+                    },
+                    timeout=20.0,
+                )
+                resp.raise_for_status()
+                result = resp.json().get("result", "0x0")
+                return round(int(result, 16) / 1_000_000, 6)
+            except Exception:
+                continue
+        return None
+
+    def _sync_shared_bankroll_to_wallet(self):
+        wallet_balance = self._get_live_wallet_usdc_balance()
+        if wallet_balance is None:
+            return
+        import fcntl
+        br_path   = "/root/shared_bankroll.json"
+        lock_path = "/root/shared_bankroll.json.lock"
+        try:
+            with open(lock_path, "w") as lf:
+                fcntl.flock(lf, fcntl.LOCK_EX)
+                try:
+                    with open(br_path) as f:
+                        data = json.load(f)
+                except Exception:
+                    data = {"balance": wallet_balance, "initial_balance": wallet_balance}
+                data["balance"] = round(wallet_balance, 4)
+                with open(br_path, "w") as f:
+                    json.dump(data, f)
+                self.bankroll = data["balance"]
+        except Exception as e:
+            logger.warning(f"bankroll sync failed: {e}")
+
+    def _log_settle_skip(self, pos_id: str, reason: str):
+        now = time.time()
+        key = (pos_id, reason)
+        last = self._settle_skip_log_ts.get(key, 0.0)
+        if now - last >= 60.0:
+            logger.info(f"settle: no confirmed {reason} activity yet for {pos_id}, skipping")
+            self._settle_skip_log_ts[key] = now
+
+    def _resolve_proxy_funder(self, signer_addr: str, fallback_addr: str) -> str:
+        try:
+            from eth_utils import keccak
+
+            selector = keccak(text="getPolyProxyWalletAddress(address)")[:4].hex()
+            call_data = "0x" + selector + signer_addr.lower().replace("0x", "").rjust(64, "0")
+            rpc_urls = [
+                os.getenv("POLYGON_RPC_URL", ""),
+                os.getenv("RPC_URL", ""),
+                "https://polygon-bor-rpc.publicnode.com",
+            ]
+            for rpc_url in rpc_urls:
+                if not rpc_url:
+                    continue
+                try:
+                    resp = httpx.post(
+                        rpc_url,
+                        json={
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "eth_call",
+                            "params": [
+                                {"to": POLY_CTF_EXCHANGE, "data": call_data},
+                                "latest",
+                            ],
+                        },
+                        timeout=20.0,
+                    )
+                    resp.raise_for_status()
+                    result = resp.json().get("result", "")
+                    if isinstance(result, str) and len(result) == 66:
+                        return "0x" + result[-40:]
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.warning(f"proxy funder resolution failed: {e}")
+        return fallback_addr
+
+    def _live_owner(self) -> str:
+        if self._poly_client and getattr(self._poly_client, "builder", None):
+            owner = getattr(self._poly_client.builder, "funder", "")
+            if owner:
+                return owner
+        return os.getenv("POLYMARKET_ADDRESS", "")
+
+    async def _get_recent_live_trade_data(
+        self, token_id: str, side: str, since_ts: float
+    ) -> Optional[dict]:
+        owner = self._live_owner()
+        if not owner:
+            return None
+        try:
+            r = await self._http.get(
+                "https://data-api.polymarket.com/activity",
+                params={"user": owner, "limit": 200},
+            )
+            if r.status_code != 200:
+                return None
+            fills = [
+                x for x in r.json()
+                if x.get("type") == "TRADE"
+                and str(x.get("asset", "")) == str(token_id)
+                and str(x.get("side", "")).upper() == side.upper()
+                and float(x.get("timestamp", 0) or 0) >= since_ts - 1
+            ]
+            if not fills:
+                return None
+            fills.sort(key=lambda x: (float(x.get("timestamp", 0) or 0), x.get("transactionHash", "")))
+            usdc_spent = sum(float(x.get("usdcSize", 0) or 0) for x in fills)
+            filled_size = sum(float(x.get("size", 0) or 0) for x in fills)
+            tx_hashes = [x.get("transactionHash", "") for x in fills if x.get("transactionHash")]
+            latest_ts = max(float(x.get("timestamp", 0) or 0) for x in fills)
+            return {
+                "cost_usd": round(usdc_spent, 6),
+                "contracts": round(filled_size, 6),
+                "entry_price": round(usdc_spent / filled_size, 6) if filled_size else 0.0,
+                "tx_hash": ",".join(dict.fromkeys(tx_hashes)) or "live_ok",
+                "latest_ts": latest_ts,
+            }
+        except Exception as e:
+            logger.warning(f"live trade reconciliation fetch failed: {e}")
+            return None
+
+    async def _await_live_trade_data(
+        self, token_id: str, side: str, since_ts: float, timeout_secs: float = 60.0
+    ) -> Optional[dict]:
+        deadline = time.time() + timeout_secs
+        while time.time() < deadline:
+            data = await self._get_recent_live_trade_data(token_id, side, since_ts)
+            if data and float(data.get("contracts", 0) or 0) > 0:
+                return data
+            await asyncio.sleep(2)
+        return await self._get_recent_live_trade_data(token_id, side, since_ts)
+
+    async def _get_confirmed_settlement_data(self, pos: Position) -> Optional[dict]:
+        owner = self._live_owner()
+        if not owner:
+            return None
+        try:
+            r = await self._http.get(
+                "https://data-api.polymarket.com/activity",
+                params={"user": owner, "limit": 200},
+            )
+            if r.status_code != 200:
+                return None
+            exits = []
+            for x in r.json():
+                if str(x.get("asset", "")) != pos.token_id:
+                    continue
+                if float(x.get("timestamp", 0) or 0) < pos.ts_open - 1:
+                    continue
+                is_redeem = x.get("type") == "REDEEM"
+                is_sell = x.get("type") == "TRADE" and str(x.get("side", "")).upper() == "SELL"
+                if is_redeem or is_sell:
+                    exits.append(x)
+            if not exits:
+                return None
+            exits.sort(key=lambda x: (float(x.get("timestamp", 0) or 0), x.get("transactionHash", "")))
+            payout_usd = sum(float(x.get("usdcSize", 0) or 0) for x in exits)
+            exit_size = sum(float(x.get("size", 0) or 0) for x in exits)
+            tx_hashes = [x.get("transactionHash", "") for x in exits if x.get("transactionHash")]
+            latest_ts = max(float(x.get("timestamp", 0) or 0) for x in exits)
+            pnl = payout_usd - pos.cost_usd
+            if exit_size > 0:
+                exit_price = payout_usd / exit_size
+            elif payout_usd > 0:
+                exit_price = payout_usd / pos.contracts if pos.contracts else 0.0
+            else:
+                exit_price = 0.0
+            return {
+                "exit_price": round(exit_price, 6),
+                "payout_usd": round(payout_usd, 6),
+                "realized_pnl": round(pnl, 4),
+                "status": "won" if pnl > 0 else "lost",
+                "tx_hash": ",".join(dict.fromkeys(tx_hashes)) or pos.tx_hash,
+                "ts_close": latest_ts,
+            }
+        except Exception as e:
+            logger.warning(f"settlement activity fetch failed for {pos.id}: {e}")
+            return None
+
+    async def _get_confirmed_entry_data(self, pos: Position) -> Optional[dict]:
+        entry = await self._get_recent_live_trade_data(pos.token_id, "BUY", pos.ts_open)
+        if not entry:
+            return None
+        if float(entry.get("contracts", 0) or 0) <= 0 or float(entry.get("cost_usd", 0) or 0) <= 0:
+            return None
+        return entry
+
 
     def _init_live_client(self):
 
@@ -238,6 +460,7 @@ class PolyExecutor:
             from py_clob_client.client import ClobClient
 
             from py_clob_client.clob_types import ApiCreds
+            from eth_account import Account
 
             key  = os.getenv("POLYMARKET_PRIVATE_KEY", "")
 
@@ -249,6 +472,14 @@ class PolyExecutor:
 
                 return
 
+            signer_addr = Account.from_key(key).address
+            funder_addr = self._resolve_proxy_funder(signer_addr, addr)
+            if funder_addr.lower() != addr.lower():
+                logger.warning(
+                    f"POLYMARKET_ADDRESS {addr} does not match proxy maker for signer "
+                    f"{signer_addr}; using {funder_addr}"
+                )
+
             self._poly_client = ClobClient(
 
                 host           = "https://clob.polymarket.com",
@@ -257,13 +488,17 @@ class PolyExecutor:
 
                 chain_id       = 137,
 
-                signature_type = 1,
+                signature_type = POLY_SIGNATURE_TYPE,
 
-                funder         = addr,
+                funder         = funder_addr,
 
             )
 
-            logger.info(f"PolyExecutor LIVE client initialised for {addr[:12]}…")
+            creds = self._poly_client.create_or_derive_api_creds()
+            self._poly_client.set_api_creds(creds)
+            logger.info(
+                f"PolyExecutor LIVE client initialised for maker={funder_addr} signer={signer_addr}"
+            )
 
         except Exception as e:
 
@@ -471,45 +706,42 @@ class PolyExecutor:
 
 
 
-        # Build position record
-
         pos_id = f"{market['condition_id'][:8]}-{direction}-{int(time.time())}"
-
-        pos = Position(
-
-            id           = pos_id,
-
-            condition_id = market["condition_id"],
-
-            token_id     = token_id,
-
-            direction    = direction,
-
-            symbol       = market["symbol"],
-
-            title        = market["title"],
-
-            source       = source,
-
-            confidence   = confidence,
-
-            contracts    = contracts,
-
-            entry_price  = ask_price,
-
-            cost_usd     = round(cost_usd, 4),
-
-            end_time     = market["end_time"],
-
-            ts_open      = time.time(),
-
-            paper        = self.paper_mode,
-
-        )
 
 
 
         if self.paper_mode:
+            pos = Position(
+
+                id           = pos_id,
+
+                condition_id = market["condition_id"],
+
+                token_id     = token_id,
+
+                direction    = direction,
+
+                symbol       = market["symbol"],
+
+                title        = market["title"],
+
+                source       = source,
+
+                confidence   = confidence,
+
+                contracts    = contracts,
+
+                entry_price  = ask_price,
+
+                cost_usd     = round(cost_usd, 4),
+
+                end_time     = market["end_time"],
+
+                ts_open      = time.time(),
+
+                paper        = self.paper_mode,
+
+            )
 
             self._positions[pos_id] = pos
 
@@ -530,13 +762,45 @@ class PolyExecutor:
 
         else:
 
-            tx = await self._execute_live(token_id, contracts, ask_price)
+            live_fill = await self._execute_live(token_id, contracts, ask_price)
 
-            if tx is None:
+            if live_fill is None:
 
                 return None, "live_execution_failed"
 
-            pos.tx_hash = tx
+            pos = Position(
+
+                id           = pos_id,
+
+                condition_id = market["condition_id"],
+
+                token_id     = token_id,
+
+                direction    = direction,
+
+                symbol       = market["symbol"],
+
+                title        = market["title"],
+
+                source       = source,
+
+                confidence   = confidence,
+
+                contracts    = float(live_fill["contracts"]),
+
+                entry_price  = float(live_fill["entry_price"]),
+
+                cost_usd     = round(float(live_fill["cost_usd"]), 4),
+
+                end_time     = market["end_time"],
+
+                ts_open      = float(live_fill.get("ts_open", time.time())),
+
+                paper        = self.paper_mode,
+
+                tx_hash      = live_fill["tx_hash"],
+
+            )
 
             self._positions[pos_id] = pos
 
@@ -546,12 +810,12 @@ class PolyExecutor:
 
                 f"LIVE TRADE: {direction} {market['symbol']} "
 
-                f"@{ask_price:.3f}  {contracts} contracts  "
+                f"@{pos.entry_price:.3f}  {pos.contracts} contracts  "
 
-                f"cost=${cost_usd:.2f}  tx={tx[:16]}…"
+                f"cost=${pos.cost_usd:.2f}  tx={pos.tx_hash[:16]}…"
 
             )
-            self._update_shared_bankroll(-cost_usd)
+            self._update_shared_bankroll(-pos.cost_usd)
 
 
 
@@ -591,70 +855,45 @@ class PolyExecutor:
 
     async def _settle(self, pos: Position):
 
-        """Query Polymarket for final price of this token and compute P&L."""
+        """Only settle after Polymarket shows a confirmed cash exit."""
 
-        try:
+        entry = await self._get_confirmed_entry_data(pos)
+        if entry is None:
+            self._log_settle_skip(pos.id, "entry")
+            return
+        pos.contracts = float(entry["contracts"])
+        pos.entry_price = float(entry["entry_price"])
+        pos.cost_usd = round(float(entry["cost_usd"]), 4)
+        pos.tx_hash = str(entry.get("tx_hash") or pos.tx_hash)
 
-            r = await self._http.get(
-
-                "https://clob.polymarket.com/last-trade-price",
-
-                params={"token_id": pos.token_id},
-
-            )
-
-            if r.status_code == 200:
-
-                data = r.json()
-
-                exit_price = float(data.get("price", 0))
-
-            else:
-
-                # fallback: check if redeemable via data-api
-
-                exit_price = await self._get_exit_price_from_data_api(pos)
-
-        except Exception as e:
-
-            logger.warning(f"settle: price fetch failed for {pos.id}: {e}")
-
-            exit_price = await self._get_exit_price_from_data_api(pos)
-
-
-
-        if exit_price is None:
-
-            logger.warning(f"settle: could not determine exit price for {pos.id}, skipping")
-
+        settlement = await self._get_confirmed_settlement_data(pos)
+        if settlement is None:
+            self._log_settle_skip(pos.id, "exit")
             return
 
+        pos.exit_price   = float(settlement["exit_price"])
 
+        pos.realized_pnl = float(settlement["realized_pnl"])
 
-        # P&L: (exit - entry) * contracts — fee already paid at entry
+        pos.ts_close     = float(settlement["ts_close"])
 
-        pnl = (exit_price - pos.entry_price) * pos.contracts
-
-        pos.exit_price   = exit_price
-
-        pos.realized_pnl = round(pnl, 4)
-
-        pos.ts_close     = time.time()
-
-        pos.status       = "won" if pnl > 0 else "lost"
+        pos.status       = str(settlement["status"])
+        pos.tx_hash      = str(settlement.get("tx_hash") or pos.tx_hash)
+        self._settle_skip_log_ts.pop((pos.id, "entry"), None)
+        self._settle_skip_log_ts.pop((pos.id, "exit"), None)
 
 
 
         self._log_position(pos, event="close")
-        self._update_shared_bankroll(pos.contracts * pos.exit_price)
+        self._update_shared_bankroll(float(settlement["payout_usd"]))
 
         logger.info(
 
             f"{_LABEL}SETTLED {pos.status.upper()}: {pos.direction} {pos.symbol} "
 
-            f"entry={pos.entry_price:.3f} exit={exit_price:.3f} "
+            f"entry={pos.entry_price:.3f} exit={pos.exit_price:.3f} "
 
-            f"pnl=${pnl:+.2f}  src={pos.source}"
+            f"pnl=${pos.realized_pnl:+.2f}  src={pos.source}"
 
         )
 
@@ -666,7 +905,7 @@ class PolyExecutor:
 
         try:
 
-            owner = os.getenv("POLYMARKET_ADDRESS", "")
+            owner = self._live_owner()
 
             if not owner:
 
@@ -712,7 +951,7 @@ class PolyExecutor:
 
     async def _execute_live(self, token_id: str, contracts: int,
 
-                            max_price: float) -> Optional[str]:
+                            max_price: float) -> Optional[dict]:
 
         if not self._poly_client:
 
@@ -723,40 +962,161 @@ class PolyExecutor:
         try:
 
             loop = asyncio.get_event_loop()
+            submit_ts = time.time()
 
 
 
             def _place():
 
                 from py_clob_client.clob_types import MarketOrderArgs, OrderType
+                from py_clob_client.config import get_contract_config
+                from py_clob_client.utilities import order_to_json
+
+                tick_size = self._poly_client.get_tick_size(token_id)
+                quantized_price = float(
+                    Decimal(str(max_price)).quantize(
+                        Decimal(str(tick_size)),
+                        rounding=ROUND_HALF_UP,
+                    )
+                )
+                buy_amount = round(contracts * quantized_price, 6)
 
                 args = MarketOrderArgs(
 
                     token_id=token_id,
 
-                    amount=contracts,
+                    amount=buy_amount,
 
                     side="BUY",
 
-                    price=max_price,
+                    price=quantized_price,
 
                     order_type=OrderType.FOK,
 
                 )
+                order = self._poly_client.create_market_order(args)
+                body = order_to_json(order, self._poly_client.creds.api_key, OrderType.FOK, False)
+                body_for_log = dict(body)
+                body_for_log["owner"] = "<redacted>"
+                exchange = get_contract_config(self._poly_client.signer.get_chain_id(), False).exchange
+                logger.info(
+                    "[live-debug] token_id=%s side=%s price=%s contracts=%s amount=%s maker=%s signer=%s "
+                    "signature_type=%s chainId=%s exchange=%s order=%s payload=%s signature=%s",
+                    token_id,
+                    "BUY",
+                    quantized_price,
+                    contracts,
+                    buy_amount,
+                    order.dict().get("maker"),
+                    order.dict().get("signer"),
+                    order.dict().get("signatureType"),
+                    self._poly_client.signer.get_chain_id(),
+                    exchange,
+                    order.dict(),
+                    body_for_log,
+                    order.signature,
+                )
 
-                return self._poly_client.create_and_post_order(args)
+
+                # ── Residential proxy gate (CLOB geoblock workaround) ─
+                # Swaps the module-level httpx.Client ONLY for post_order().
+                # Reads, WS, and all upstream calls stay on direct connection.
+                import py_clob_client.http_helpers.helpers as _ph
+                import httpx as _httpx
+                import time as _pt
+                _proxy_url = os.getenv('CLOB_PROXY_URL', '')
+                if _proxy_url:
+                    _orig_client = _ph._http_client
+                    try:
+                        _proxied = _httpx.Client(
+                            http2=True, proxy=_proxy_url, timeout=20.0
+                        )
+                    except TypeError:
+                        # httpx < 0.24 uses proxies= keyword
+                        _proxied = _httpx.Client(
+                            http2=True, proxies=_proxy_url, timeout=20.0
+                        )
+                    _ph._http_client = _proxied
+                    _pt0 = _pt.time()
+                    try:
+                        _res = self._poly_client.post_order(order)
+                        logger.info(
+                            f'[proxy] POST /order OK in {_pt.time()-_pt0:.2f}s'
+                        )
+                        return _res
+                    except Exception as _pe:
+                        _emsg = str(_pe)
+                        _elapsed = _pt.time() - _pt0
+                        if '403' in _emsg:
+                            logger.error(
+                                f'[proxy] 403 geoblock through proxy '
+                                f'in {_elapsed:.2f}s — proxy may also be blocked: '
+                                f'{_emsg[:150]}'
+                            )
+                        elif any(k in _emsg.lower()
+                                 for k in ('proxy','connect','timeout','socks')):
+                            logger.error(
+                                f'[proxy] proxy connection failure '
+                                f'in {_elapsed:.2f}s: {_emsg[:150]}'
+                            )
+                        else:
+                            logger.error(
+                                f'[proxy] upstream error in {_elapsed:.2f}s: '
+                                f'{_emsg[:150]}'
+                            )
+                        raise
+                    finally:
+                        _ph._http_client = _orig_client
+                        try:
+                            _proxied.close()
+                        except Exception:
+                            pass
+                else:
+                    return self._poly_client.post_order(order)
 
 
 
             result = await loop.run_in_executor(None, _place)
-
-            tx_hash = result.get("transactionHash", "") if isinstance(result, dict) else str(result)
-
-            return tx_hash or "live_ok"
+            logger.info(f"[clob-result] raw={result}")
+            # Fast-path: if result directly indicates a fill, skip activity polling
+            fill_data = None
+            if isinstance(result, dict):
+                matched = result.get("matchedOrders") or result.get("fills") or []
+                if matched:
+                    logger.info(f"[clob-result] detected direct fill, skipping activity poll")
+                    fill_data = await self._get_recent_live_trade_data(token_id, "BUY", submit_ts - 5)
+            if fill_data is None:
+                fill_data = await self._await_live_trade_data(token_id, "BUY", submit_ts)
+            if fill_data is None:
+                logger.error("Live fill reconciliation failed: no matching activity found")
+                return None
+            if float(fill_data.get("contracts", 0) or 0) <= 0 or float(fill_data.get("cost_usd", 0) or 0) <= 0:
+                logger.error("Live fill reconciliation returned zero fill data; skipping position open")
+                return None
+            if "tx_hash" not in fill_data or not fill_data["tx_hash"]:
+                tx_hash = result.get("transactionHash", "") if isinstance(result, dict) else str(result)
+                fill_data["tx_hash"] = tx_hash or "live_ok"
+            fill_data["ts_open"] = submit_ts
+            return fill_data
 
         except Exception as e:
 
             logger.error(f"Live execution failed: {e}")
+
+            # Post-exception activity rescue: the order may have filled on-chain
+            # before the proxy dropped the connection. Wait briefly, then check.
+            try:
+                logger.warning("[rescue] _place() threw — checking activity API for fill (30s window)")
+                await asyncio.sleep(5)
+                rescue_data = await self._await_live_trade_data(token_id, "BUY", submit_ts, timeout_secs=30.0)
+                if rescue_data and float(rescue_data.get("contracts", 0) or 0) > 0:
+                    logger.info(f"[rescue] recovered fill from activity API: {rescue_data}")
+                    rescue_data.setdefault("tx_hash", "rescue_ok")
+                    rescue_data["ts_open"] = submit_ts
+                    return rescue_data
+                logger.warning("[rescue] no fill found in activity API after exception")
+            except Exception as re:
+                logger.error(f"[rescue] activity check failed: {re}")
 
             return None
 
