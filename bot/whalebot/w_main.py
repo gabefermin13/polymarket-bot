@@ -262,6 +262,12 @@ Path(LOGS_DIR).mkdir(parents=True, exist_ok=True)
 
 
 
+_log_handlers = [
+    logging.FileHandler(f"{LOGS_DIR}/bot.log", encoding="utf-8"),
+]
+if os.isatty(1):
+    _log_handlers.append(logging.StreamHandler(sys.stdout))
+
 logging.basicConfig(
 
 
@@ -278,19 +284,18 @@ logging.basicConfig(
 
 
 
-    handlers=[
+    handlers=_log_handlers,
+    force=True,
 
 
 
-        logging.FileHandler(f"{LOGS_DIR}/bot.log", encoding="utf-8"),
 
 
 
-        logging.StreamHandler(sys.stdout),
 
 
 
-    ],
+    
 
 
 

@@ -1094,6 +1094,9 @@ _ml = _get_ml_predictor("/root/shared_ml")
 
 
 CONSENSUS_REQUIRED = int(os.getenv("CONSENSUS_REQUIRED", "3"))
+# Pass-2 weighted threshold (float, lower than pass-1 integer count because IC-weights
+# deflate the score — S2 contrarian subtracts 0.5 when it agrees with direction).
+PASS2_N_REQUIRED = float(os.getenv("PASS2_N_REQUIRED", str(max(1.0, CONSENSUS_REQUIRED - 1.0))))
 
 
 
@@ -1333,6 +1336,12 @@ Path(LOGS_DIR).mkdir(parents=True, exist_ok=True)
 
 
 
+_log_handlers = [
+    logging.FileHandler(f"{LOGS_DIR}/bot.log", encoding="utf-8"),
+]
+if os.isatty(1):
+    _log_handlers.append(logging.StreamHandler())
+
 logging.basicConfig(
 
 
@@ -1429,7 +1438,8 @@ logging.basicConfig(
 
 
 
-    handlers=[
+    handlers=_log_handlers,
+    force=True,
 
 
 
@@ -1453,7 +1463,6 @@ logging.basicConfig(
 
 
 
-        logging.FileHandler(f"{LOGS_DIR}/bot.log", encoding="utf-8"),
 
 
 
@@ -1477,7 +1486,6 @@ logging.basicConfig(
 
 
 
-        logging.StreamHandler(),
 
 
 
@@ -1501,7 +1509,7 @@ logging.basicConfig(
 
 
 
-    ],
+    
 
 
 
@@ -8115,7 +8123,7 @@ async def _scan_once(
 
 
 
-            if n_for_dir < CONSENSUS_REQUIRED:
+            if n_for_dir < PASS2_N_REQUIRED:
 
 
 
@@ -8163,7 +8171,7 @@ async def _scan_once(
 
 
 
-                    f"{asset}: {n_for_dir} agreeing signals (need {CONSENSUS_REQUIRED}) — skip"
+                    f"{asset}: {n_for_dir:.2f} agreeing signals (need {PASS2_N_REQUIRED:.1f}) — skip"
 
 
 
