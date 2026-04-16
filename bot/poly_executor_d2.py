@@ -1126,6 +1126,14 @@ class PolyExecutor:
 
 
 
+    def _tax_reserve_usd(self) -> float:
+        try:
+            import json as _j
+            with open('/root/tax_reserve.json') as _f:
+                return float(_j.load(_f).get('reserve_usd', 0))
+        except Exception:
+            return 0.0
+
     def _kelly_size(self, confidence: float, ask_price: float, multiplier: float = 1.0) -> int:
 
         """
@@ -1158,7 +1166,7 @@ class PolyExecutor:
 
 
 
-        dollars   = kelly * self.bankroll
+        dollars   = kelly * max(self.bankroll - self._tax_reserve_usd(), 1.0)
 
         contracts = int(dollars / ask_price)
 
@@ -1289,6 +1297,137 @@ class PolyExecutor:
             return None
 
 
+
+    async def _get_best_bid(self, token_id: str) -> float | None:
+        try:
+            r = await self._http.get(
+                "https://clob.polymarket.com/book",
+                params={"token_id": token_id},
+            )
+            if r.status_code != 200:
+                return None
+            bids = r.json().get("bids", [])
+            if not bids:
+                return None
+            best = max(bids, key=lambda x: float(x.get("price", 0.0)))
+            return float(best["price"])
+        except Exception as e:
+            logger.debug(f"_get_best_bid failed: {e}")
+            return None
+
+    async def _execute_live_sell(
+        self, token_id: str, contracts: int, min_price: float
+    ) -> tuple | None:
+        """Send a SELL FOK order. Returns (fill_price, tx_hash) or None on failure."""
+        import asyncio as _asyncio
+        loop = _asyncio.get_event_loop()
+        submit_ts = time.time()
+
+        def _place_sell():
+            from py_clob_client.clob_types import MarketOrderArgs, OrderType
+            tick_size = self._poly_client.get_tick_size(token_id)
+            quantized_price = float(
+                Decimal(str(min_price)).quantize(
+                    Decimal(str(tick_size)), rounding=ROUND_HALF_UP
+                )
+            )
+            args = MarketOrderArgs(
+                token_id=token_id,
+                amount=float(contracts),
+                side="SELL",
+                price=quantized_price,
+                order_type=OrderType.FOK,
+            )
+            order = self._poly_client.create_market_order(args)
+            import py_clob_client.http_helpers.helpers as _ph
+            import httpx as _httpx
+            _proxy_url = os.getenv("CLOB_PROXY_URL", "")
+            if _proxy_url:
+                _orig = _ph._http_client
+                try:
+                    try:
+                        _px = _httpx.Client(http2=True, proxy=_proxy_url, timeout=20.0)
+                    except TypeError:
+                        _px = _httpx.Client(http2=True, proxies=_proxy_url, timeout=20.0)
+                    _ph._http_client = _px
+                    return self._poly_client.post_order(order)
+                finally:
+                    _ph._http_client = _orig
+                    try:
+                        _px.close()
+                    except Exception:
+                        pass
+            else:
+                return self._poly_client.post_order(order)
+
+        try:
+            result = await loop.run_in_executor(None, _place_sell)
+            logger.info(f"[sell-result] raw={result}")
+            fill = await self._get_recent_live_trade_data(token_id, "SELL", submit_ts - 5)
+            if fill:
+                return (float(fill.get("price", min_price)), fill.get("tx_hash", "sell_ok"))
+            return (min_price, "sell_ok")
+        except Exception as exc:
+            logger.error(f"_execute_live_sell failed: {exc}")
+            return None
+
+    async def close_position(
+        self,
+        pos: "Position",
+        reason: str = "profit_lock",
+        bid_price: float | None = None,
+    ) -> bool:
+        """
+        Close an open position early by selling on the CLOB.
+        Returns True if closed successfully.
+        """
+        if pos.status != "open":
+            return False
+        if bid_price is None:
+            bid_price = await self._get_best_bid(pos.token_id)
+        if bid_price is None or bid_price <= 0:
+            logger.warning(f"close_position: no bid for {pos.id}")
+            return False
+
+        payout       = pos.contracts * bid_price
+        realized_pnl = round(payout - pos.cost_usd, 4)
+        now          = time.time()
+
+        if self.paper_mode:
+            pos.exit_price   = bid_price
+            pos.realized_pnl = realized_pnl
+            pos.ts_close     = now
+            pos.status       = "won" if realized_pnl > 0 else "lost"
+            pos.tx_hash      = reason
+            self._log_position(pos, event="close")
+            self._update_shared_bankroll(payout)
+            logger.info(
+                f"PROFIT LOCK [{reason}]: {pos.direction} {pos.symbol} "
+                f"@{pos.entry_price:.3f}->{bid_price:.3f}  "
+                f"pnl=${realized_pnl:+.2f}  payout=${payout:.2f}"
+            )
+            return True
+        else:
+            sold = await self._execute_live_sell(pos.token_id, pos.contracts, bid_price)
+            if sold is None:
+                logger.warning(f"close_position: live sell failed for {pos.id}")
+                return False
+            actual_price, tx = sold
+            payout       = pos.contracts * actual_price
+            realized_pnl = round(payout - pos.cost_usd, 4)
+            pos.exit_price   = actual_price
+            pos.realized_pnl = realized_pnl
+            pos.ts_close     = now
+            pos.status       = "won" if realized_pnl > 0 else "lost"
+            pos.tx_hash      = tx
+            self._log_position(pos, event="close")
+            self._update_shared_bankroll(payout)
+            logger.info(
+                f"PROFIT LOCK LIVE [{reason}]: {pos.direction} {pos.symbol} "
+                f"@{pos.entry_price:.3f}->{actual_price:.3f}  "
+                f"pnl=${realized_pnl:+.2f}  payout=${payout:.2f}"
+            )
+            return True
 
     # ── Logging ───────────────────────────────────────────────────────────────
 

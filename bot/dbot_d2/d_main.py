@@ -1750,6 +1750,7 @@ from quality_model   import QualityModel
 
 
 from choppiness_gate import ChoppinessGate
+import chop_classifier as _chop
 
 
 
@@ -7557,7 +7558,17 @@ async def _scan_once(
 
 
 
-            # Autocorrelation adjustment — recent streak boosts/fades confidence
+            
+            # Chop classifier — score price action quality in Ranging regime
+            _chop_result = await _chop.classify(asset, client)
+            chop_kelly_mult = 1.0
+            if regime is None and _chop_result.is_chop:
+                chop_kelly_mult = float(os.getenv("CHOP_KELLY_MULT", "0.6"))
+                logger.info(
+                    f"{asset} {direction_pm}: chop detected "
+                    f"{_chop_result.summary()} → kelly_mult x{chop_kelly_mult:.1f}"
+                )
+# Autocorrelation adjustment — recent streak boosts/fades confidence
 
 
 
@@ -9354,7 +9365,19 @@ async def _scan_once(
 
             )
 
-            # Price structure rule (Step 2): if YES ask < 0.30, flip to Down
+                        # Chop center guard: in chop regime, skip mid-market trades (range edges only)
+            if regime is None and _chop_result.is_chop:
+                _chop_lo = float(os.getenv("CHOP_EDGE_LO", "0.44"))
+                _chop_hi = float(os.getenv("CHOP_EDGE_HI", "0.56"))
+                if _chop_lo < _ev.ask < _chop_hi:
+                    logger.info(
+                        f"{asset} {direction_pm}: chop center skip "
+                        f"ask={_ev.ask:.3f} (need <{_chop_lo} or >{_chop_hi})"
+                    )
+                    _log_signal({**sig_base, "executed": False, "skip_reason": "chop_center"})
+                    continue
+
+# Price structure rule (Step 2): if YES ask < 0.30, flip to Down
             if direction_pm == "Up" and _ev.ask < 0.30:
                 _flip_market = _pick_market(markets, "Down")
                 if _flip_market is None:
@@ -9869,7 +9892,7 @@ async def _scan_once(
 
 
 
-                kelly_multiplier = kelly_mult * peak_mult * _ml_score.kelly_scale * _tier_mult * _kronos_mult * _ev_mult,
+                kelly_multiplier = kelly_mult * peak_mult * _ml_score.kelly_scale * _tier_mult * _kronos_mult * _ev_mult * chop_kelly_mult,
 
 
 
@@ -10616,6 +10639,40 @@ async def _scan_once(
 
 
 
+
+
+PROFIT_LOCK_PCT      = float(os.getenv("PROFIT_LOCK_PCT",      "0.70"))
+PROFIT_LOCK_SECS     = float(os.getenv("PROFIT_LOCK_SECS",     "90"))
+PROFIT_LOCK_INTERVAL = float(os.getenv("PROFIT_LOCK_INTERVAL", "10"))
+
+
+async def profit_lock_loop(executor):
+    """
+    Checks open positions every PROFIT_LOCK_INTERVAL seconds.
+    If a position has >= PROFIT_LOCK_PCT unrealized gain and < PROFIT_LOCK_SECS to expiry,
+    closes it immediately via SELL order.
+    """
+    while True:
+        await asyncio.sleep(PROFIT_LOCK_INTERVAL)
+        try:
+            for pos in list(executor.open_positions()):
+                secs_left = pos.end_time - time.time()
+                if secs_left <= 0 or secs_left > PROFIT_LOCK_SECS:
+                    continue
+                bid = await executor._get_best_bid(pos.token_id)
+                if bid is None or bid <= 0:
+                    continue
+                gain_pct = (bid - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0.0
+                if gain_pct >= PROFIT_LOCK_PCT:
+                    logger.info(
+                        f"[D2] PROFIT LOCK: {pos.direction} {pos.symbol} "
+                        f"gain={gain_pct:.1%} bid={bid:.3f} secs_left={secs_left:.0f}s"
+                    )
+                    await executor.close_position(pos, reason="profit_lock")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"profit_lock_loop error: {exc}")
 
 
 async def signal_scan_loop(
@@ -16104,6 +16161,8 @@ async def main():
 
 
             late_entry_scan_loop(executor, mf, tg),
+
+            profit_lock_loop(executor),
 
 
 

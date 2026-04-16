@@ -262,6 +262,12 @@ Path(LOGS_DIR).mkdir(parents=True, exist_ok=True)
 
 
 
+_log_handlers = [
+    logging.FileHandler(f"{LOGS_DIR}/bot.log", encoding="utf-8"),
+]
+if os.isatty(1):
+    _log_handlers.append(logging.StreamHandler(sys.stdout))
+
 logging.basicConfig(
 
 
@@ -278,19 +284,18 @@ logging.basicConfig(
 
 
 
-    handlers=[
+    handlers=_log_handlers,
+    force=True,
 
 
 
-        logging.FileHandler(f"{LOGS_DIR}/bot.log", encoding="utf-8"),
 
 
 
-        logging.StreamHandler(sys.stdout),
 
 
 
-    ],
+    
 
 
 
@@ -351,6 +356,7 @@ from quality_model        import QualityModel
 
 
 from choppiness_gate      import ChoppinessGate
+import chop_classifier as _chop
 
 
 
@@ -1071,6 +1077,40 @@ def _ccc_to_confidence(ccc_score: float) -> float:
 
 
 
+PROFIT_LOCK_PCT      = float(os.getenv("PROFIT_LOCK_PCT",      "0.70"))
+PROFIT_LOCK_SECS     = float(os.getenv("PROFIT_LOCK_SECS",     "90"))
+PROFIT_LOCK_INTERVAL = float(os.getenv("PROFIT_LOCK_INTERVAL", "10"))
+
+
+async def profit_lock_loop(executor):
+    """
+    Checks open positions every PROFIT_LOCK_INTERVAL seconds.
+    If a position has >= PROFIT_LOCK_PCT unrealized gain and < PROFIT_LOCK_SECS to expiry,
+    closes it immediately via SELL order.
+    """
+    while True:
+        await asyncio.sleep(PROFIT_LOCK_INTERVAL)
+        try:
+            for pos in list(executor.open_positions()):
+                secs_left = pos.end_time - time.time()
+                if secs_left <= 0 or secs_left > PROFIT_LOCK_SECS:
+                    continue
+                bid = await executor._get_best_bid(pos.token_id)
+                if bid is None or bid <= 0:
+                    continue
+                gain_pct = (bid - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0.0
+                if gain_pct >= PROFIT_LOCK_PCT:
+                    logger.info(
+                        f"[W] PROFIT LOCK: {pos.direction} {pos.symbol} "
+                        f"gain={gain_pct:.1%} bid={bid:.3f} secs_left={secs_left:.0f}s"
+                    )
+                    await executor.close_position(pos, reason="profit_lock")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"profit_lock_loop error: {exc}")
+
+
 async def on_whale_trade(
 
 
@@ -1265,8 +1305,8 @@ async def on_whale_trade(
     # Combo block: skip proven losing combos (data-driven)
     _direction_pm = 'Up' if signal.direction.upper() == 'UP' else 'Down'
     _BLOCKED_COMBOS = {
-        ('ETH', 'Up'), ('ETH', 'Down'),  # 31-33% WR, negative alpha across 25 trades
-        ('BTC', 'Up'),                    # 30% WR across 20 trades, both bots systematically wrong
+        ('ETH', 'Up'), ('ETH', 'Down'),  # 31-33% WR, negative alpha — hard block maintained
+        # ('BTC', 'Up') moved to soft-penalty gate below (still gated, not fully blocked)
     }
     if (asset, _direction_pm) in _BLOCKED_COMBOS:
         logger.debug(f'[{BOT_LABEL}] {asset} {_direction_pm} blocked (low-alpha combo)')
@@ -1676,6 +1716,18 @@ async def on_whale_trade(
 
 
         sig_rec["dir_n"] = dir_n
+        # dir signal breakdown injected
+        if hasattr(r_dir, 'signal_details') and r_dir.signal_details:
+            _dsd = r_dir.signal_details
+            _dsb = ' '.join(
+                f"{k}={'D' if v.get('direction')=='DOWN' else 'U' if v.get('direction')=='UP' else '~' if v.get('direction') in ('NEUTRAL','FLAT','BALANCED') else '-'}"
+                for k, v in sorted(_dsd.items())
+            )
+            logger.info(
+                f'[{BOT_LABEL}] {asset} {signal.direction} -- '
+                f'dir sigs [{_dsb}] n={dir_n:+.1f}'
+            )
+
 
 
 
@@ -1851,6 +1903,27 @@ async def on_whale_trade(
     )
 
 
+
+    # Chop classifier — score price action quality
+    _chop_result_w = await _chop.classify(asset, http_client)
+    chop_kelly_mult_w = 1.0
+    if _chop_result_w.is_chop:
+        chop_kelly_mult_w = float(os.getenv("CHOP_KELLY_MULT", "0.6"))
+        logger.info(
+            f"[{BOT_LABEL}] {asset} {signal.direction}: chop detected "
+            f"{_chop_result_w.summary()} → kelly x{chop_kelly_mult_w:.1f}"
+        )
+    # Chop center guard: skip mid-market entries in chop
+    if _chop_result_w.is_chop:
+        _chop_lo = float(os.getenv("CHOP_EDGE_LO", "0.44"))
+        _chop_hi = float(os.getenv("CHOP_EDGE_HI", "0.56"))
+        if _chop_lo < _ev.ask < _chop_hi:
+            logger.info(
+                f"[{BOT_LABEL}] {asset} {signal.direction}: chop center skip "
+                f"ask={_ev.ask:.3f} (need <{_chop_lo} or >{_chop_hi})"
+            )
+            _log_signal({**sig_rec, "skip_reason": "chop_center"})
+            return
 
     # EV positive: boost CCC confidence
 
@@ -2058,7 +2131,8 @@ async def on_whale_trade(
 
 
 
-        kelly_multiplier = kelly_mult * _ml_score.kelly_scale * _tier_mult * _kronos_mult * _ev_mult
+        kelly_multiplier = kelly_mult * _ml_score.kelly_scale * _tier_mult * _kronos_mult * _ev_mult * chop_kelly_mult_w,
+        ask_price        = _ev.ask,
 
 
 
@@ -3277,6 +3351,8 @@ async def main():
 
 
             tg.poll_commands(),
+
+            profit_lock_loop(executor),
 
 
 
