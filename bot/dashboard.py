@@ -1,6 +1,6 @@
 """
 Polymarket Bot Dashboard — FastAPI + embedded HTML
-Tracks: D2 (directional) + W (whalebot)
+Tracks: ARB (pre-expiry drift arb) + W (whalebot)
 Deploy: /root/dashboard.py
 Run: nohup uvicorn dashboard:app --host 0.0.0.0 --port 8080 > /tmp/dashboard.log 2>&1 &
 """
@@ -29,14 +29,14 @@ app = FastAPI(title="Polymarket Bot Dashboard")
 ROOT = Path("/root")
 
 BOTS = {
-    "d2": {
-        "label": "D2",
-        "dir": ROOT / "kalshiedge_dbot_d2",
-        "log": ROOT / "kalshiedge_dbot_d2" / "logs_d2" / "bot.log",
-        "positions": ROOT / "kalshiedge_dbot_d2" / "logs_d2" / "positions.jsonl",
-        "signals": ROOT / "kalshiedge_dbot_d2" / "logs_d2" / "signals.jsonl",
-        "cwd": "/root/kalshiedge_dbot_d2",
-        "cmd_needle": "d_main",
+    "arb": {
+        "label": "ARB",
+        "dir": ROOT / "kalshiedge_arb",
+        "log": ROOT / "kalshiedge_arb" / "logs_arb" / "bot.log",
+        "positions": ROOT / "kalshiedge_arb" / "logs_arb" / "positions.jsonl",
+        "signals": ROOT / "kalshiedge_arb" / "logs_arb" / "signals.jsonl",
+        "cwd": "/root/kalshiedge_arb",
+        "cmd_needle": "arb_main",
     },
     "w": {
         "label": "W",
@@ -54,12 +54,12 @@ WHALE_POOL      = ROOT / "kalshiedge_whalebot" / "whale_pool.json"
 WALLET_CAL      = ROOT / "kalshiedge_whalebot" / "wallet_calibration.json"
 
 BOT_START_CMDS = {
-    "d2": "cd /root/kalshiedge_dbot_d2 && set -a && source .env && set +a && nohup python3 d_main.py >> logs_d2/bot.log 2>&1 &",
-    "w":  "cd /root/kalshiedge_whalebot && set -a && source .env && set +a && nohup python3 w_main.py >> logs_w/bot.log 2>&1 &",
+    "arb": "cd /root/kalshiedge_arb && set -a && source .env && set +a && nohup python3 arb_main.py > /dev/null 2>&1 &",
+    "w":   "cd /root/kalshiedge_whalebot && set -a && source .env && set +a && nohup python3 w_main.py >> logs_w/bot.log 2>&1 &",
 }
 BOT_PAUSE_FLAGS = {
-    "d2": ROOT / "d2_paused",
-    "w":  ROOT / "w_paused",
+    "arb": ROOT / "arb_paused",
+    "w":   ROOT / "w_paused",
 }
 
 _regime_cache: dict = {"data": None, "ts": 0.0}
@@ -119,8 +119,9 @@ async def _reconcile_polymarket_activity() -> int:
         logger.warning(f"[reconcile] activity fetch failed: {e}")
         return 0
 
-    # Index sells/redeems by token_id
+    # Index sells/redeems by token_id AND by conditionId (REDEEM events have empty asset)
     sells: dict = {}
+    redeems_by_condition: dict = {}
     for ev in activity:
         asset    = str(ev.get("asset", ""))
         ev_type  = ev.get("type", "")
@@ -128,6 +129,10 @@ async def _reconcile_polymarket_activity() -> int:
         is_sell  = (ev_type == "TRADE" and ev_side == "SELL") or ev_type == "REDEEM"
         if is_sell:
             sells.setdefault(asset, []).append(ev)
+            if ev_type == "REDEEM":
+                cid = str(ev.get("conditionId", ""))
+                if cid:
+                    redeems_by_condition.setdefault(cid, []).append(ev)
 
     now = time.time()
 
@@ -167,8 +172,13 @@ async def _reconcile_polymarket_activity() -> int:
             ts_open   = float(pos.get("ts_open", 0))
             cost_usd  = float(pos.get("cost_usd", 0))
 
+            condition_id = str(pos.get("condition_id", ""))
             relevant = [s for s in sells.get(token_id, [])
                         if float(s.get("timestamp", 0)) >= ts_open - 5]
+            # Also check REDEEM events indexed by conditionId (asset field is empty on REDEEMs)
+            if not relevant and condition_id:
+                relevant = [s for s in redeems_by_condition.get(condition_id, [])
+                            if float(s.get("timestamp", 0)) >= ts_open - 5]
 
             if relevant:
                 payout       = sum(float(s.get("usdcSize", 0)) for s in relevant)
@@ -180,8 +190,8 @@ async def _reconcile_polymarket_activity() -> int:
                                 "status": "won" if pnl > 0 else "lost",
                                 "exit_price": exit_price, "realized_pnl": pnl,
                                 "ts_close": ts_close, "source": "dashboard_reconcile"}
-            elif end_time > 0 and end_time < now - 300:
-                # 5 min past expiry, no sell found → expired worthless
+            elif end_time > 0 and end_time < now - 900:
+                # 15 min past expiry, no sell/redeem found → expired worthless
                 close_ev = {**pos, "event": "close", "status": "lost",
                             "exit_price": 0.0, "realized_pnl": round(-cost_usd, 4),
                             "ts_close": end_time, "source": "dashboard_reconcile"}
@@ -333,8 +343,10 @@ def _bot_stats(bot_key: str) -> dict:
 
     if pos_file.exists():
         try:
+            open_ids: dict = {}
             with open(pos_file, "r", encoding="utf-8") as f:
                 lines = f.readlines()
+            now = time.time()
             for line in lines:
                 line = line.strip()
                 if not line:
@@ -345,9 +357,11 @@ def _bot_stats(bot_key: str) -> dict:
                     continue
                 event  = rec.get("event", "")
                 status = rec.get("status", "")
-                if event == "open" and status == "open":
-                    open_pos += 1
+                pid    = rec.get("id", "")
+                if event == "open":
+                    open_ids[pid] = rec
                 elif event == "close":
+                    open_ids.pop(pid, None)
                     pnl = float(rec.get("realized_pnl", 0))
                     total_pnl += pnl
                     if status == "won":
@@ -356,6 +370,7 @@ def _bot_stats(bot_key: str) -> dict:
                         losses += 1
                     if last_trade is None or rec.get("ts_close", 0) > last_trade.get("ts_close", 0):
                         last_trade = rec
+            open_pos = sum(1 for p in open_ids.values() if p.get("end_time", 0) > now)
         except Exception:
             pass
 
@@ -464,7 +479,7 @@ async def api_status():
     regime       = await _fetch_regime()
     br           = _bankroll()
     balances     = _compute_balances()
-    d2           = _bot_stats("d2")
+    arb          = _bot_stats("arb")
     w            = _bot_stats("w")
     live_balance = await _fetch_live_usdc_balance()
     return JSONResponse({
@@ -475,8 +490,8 @@ async def api_status():
         "bankroll":       br,
         "balances":       balances,
         "live_usdc":      live_balance,
-        "combined_pnl":   round(d2["pnl"] + w["pnl"], 2),
-        "bots":           {"d2": d2, "w": w},
+        "combined_pnl":   round(arb["pnl"] + w["pnl"], 2),
+        "bots":           {"arb": arb, "w": w},
     })
 
 
@@ -602,6 +617,61 @@ async def api_log(bot: str):
         return JSONResponse({"lines": lines})
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+@app.get("/api/arb/feed")
+async def api_arb_feed(n: int = 60):
+    """Return last n ARB signal lines parsed from bot.log."""
+    import re
+    log_file = BOTS["arb"]["log"]
+    if not log_file.exists():
+        return JSONResponse({"signals": []})
+    try:
+        lines = log_file.read_text(errors="replace").splitlines()
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+    pat = re.compile(
+        r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\s+"
+        r"\[(\w+)@(\S+)\]\s+"
+        r"(?:"
+        r"(>>>\s*ENTER\s+(\w+)\s+drift=([+\-\d.]+)%\s+ask=([\d.]+)\s+ev=([\d.]+))"
+        r"|"
+        r"t=\s*([+\-\d.]+)s\s+price=[\d.]+\s+drift=([+\-\d.]+)%\s+dir=(\w+)\s+ask=([\d.None]+)\s+ev=([\d.None]+)"
+        r"|"
+        r"skipped:\s*(\S+)"
+        r")"
+    )
+
+    signals = []
+    seen_markets: dict = {}
+    for line in lines:
+        m = pat.search(line)
+        if not m:
+            continue
+        ts, asset, market_time = m.group(1), m.group(2), m.group(3)
+        key = f"{asset}@{market_time}"
+
+        if m.group(4):  # ENTER
+            signals.append({"ts": ts, "asset": asset, "market": market_time,
+                            "type": "enter", "dir": m.group(5),
+                            "drift": m.group(6), "ask": m.group(7), "ev": m.group(8)})
+            seen_markets[key] = len(signals) - 1
+        elif m.group(14):  # skipped
+            signals.append({"ts": ts, "asset": asset, "market": market_time,
+                            "type": "skip", "reason": m.group(14)})
+            seen_markets[key] = len(signals) - 1
+        else:  # tick — only keep latest per market
+            tick = {"ts": ts, "asset": asset, "market": market_time,
+                    "type": "tick", "dir": m.group(11),
+                    "drift": m.group(10), "ask": m.group(12), "ev": m.group(13)}
+            if key in seen_markets and signals[seen_markets[key]]["type"] == "tick":
+                signals[seen_markets[key]] = tick
+            else:
+                signals.append(tick)
+                seen_markets[key] = len(signals) - 1
+
+    return JSONResponse({"signals": signals[-n:]})
 
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
@@ -734,8 +804,8 @@ HTML = r"""<!DOCTYPE html>
     display: flex; align-items: center; justify-content: center;
     font-size: 12px; font-weight: 700;
   }
-  .icon-d2 { background: rgba(59,130,246,.12); color: var(--blue); border: 1px solid rgba(59,130,246,.2); }
-  .icon-w  { background: rgba(201,168,76,.10); color: var(--gold); border: 1px solid rgba(201,168,76,.2); }
+  .icon-arb { background: rgba(16,185,129,.12); color: var(--green); border: 1px solid rgba(16,185,129,.2); }
+  .icon-w   { background: rgba(201,168,76,.10); color: var(--gold); border: 1px solid rgba(201,168,76,.2); }
   .status-badge {
     font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
     padding: 3px 8px; border-radius: 100px;
@@ -771,6 +841,31 @@ HTML = r"""<!DOCTYPE html>
   .btn-danger:hover { background: rgba(239,68,68,.15); }
   .btn-start { border-color: rgba(16,185,129,.3); color: var(--green); background: var(--green-bg); }
   .btn-start:hover { background: rgba(16,185,129,.15); }
+
+  /* ── Signal feed ── */
+  .feed-section {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+    margin-bottom: 28px; overflow: hidden;
+  }
+  .feed-header {
+    padding: 16px 20px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .feed-body { max-height: 320px; overflow-y: auto; font-family: monospace; font-size: 11px; }
+  .feed-row { display: grid; grid-template-columns: 90px 55px 70px 70px 60px 60px 60px 1fr;
+    padding: 5px 16px; border-bottom: 1px solid rgba(255,255,255,.04); gap: 4px; }
+  .feed-row:last-child { border-bottom: none; }
+  .feed-row.enter { background: rgba(16,185,129,.07); }
+  .feed-row.skip  { background: rgba(239,68,68,.05); }
+  .feed-row.tick  { color: var(--muted); }
+  .feed-head { font-size: 10px; font-weight: 600; color: var(--muted); padding: 6px 16px;
+    border-bottom: 1px solid var(--line); text-transform: uppercase; letter-spacing: .05em;
+    display: grid; grid-template-columns: 90px 55px 70px 70px 60px 60px 60px 1fr; gap: 4px; }
+  .tag-enter { color: var(--green); font-weight: 700; }
+  .tag-skip  { color: var(--red); }
+  .tag-tick  { color: var(--muted); }
+  .dir-up   { color: var(--green); }
+  .dir-down { color: var(--red); }
 
   /* ── Chart section ── */
   .chart-section {
@@ -844,8 +939,8 @@ HTML = r"""<!DOCTYPE html>
   .bot-tag {
     font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 4px; letter-spacing: .03em;
   }
-  .bot-d2 { background: rgba(59,130,246,.1); color: var(--blue); }
-  .bot-w  { background: rgba(201,168,76,.1); color: var(--gold); }
+  .bot-arb { background: rgba(16,185,129,.1); color: var(--green); }
+  .bot-w   { background: rgba(201,168,76,.1); color: var(--gold); }
   .dir-up   { color: var(--green); font-weight: 600; }
   .dir-down { color: var(--red);   font-weight: 600; }
 
@@ -939,43 +1034,43 @@ HTML = r"""<!DOCTYPE html>
   <div class="section-label">ACTIVE STRATEGIES</div>
   <div class="two-col">
 
-    <!-- D2 -->
+    <!-- ARB -->
     <div class="strategy-card">
       <div class="card-header">
         <div class="card-title">
-          <div class="strategy-icon icon-d2">D2</div>
+          <div class="strategy-icon icon-arb">ARB</div>
           <div>
-            <div style="font-size:13px;font-weight:600;">Directional Consensus</div>
-            <div style="font-size:11px;color:var(--muted);font-weight:400;margin-top:2px;">S1–S10 · IC-weighted · S2 contrarian · S3 1.5× · BTC ETH DOGE</div>
+            <div style="font-size:13px;font-weight:600;">Pre-Expiry Drift Arb</div>
+            <div style="font-size:11px;color:var(--muted);font-weight:400;margin-top:2px;">BTC ETH SOL DOGE XRP · |drift|&gt;0.05% · EV&gt;0.10</div>
           </div>
         </div>
-        <span id="d2-status" class="status-badge status-off">OFFLINE</span>
+        <span id="arb-status" class="status-badge status-off">OFFLINE</span>
       </div>
       <div class="card-body">
         <div class="stat-grid">
           <div class="stat-item">
             <div class="stat-label">P&amp;L</div>
-            <div class="stat-value" id="d2-pnl">--</div>
+            <div class="stat-value" id="arb-pnl">--</div>
           </div>
           <div class="stat-item">
             <div class="stat-label">Win Rate</div>
-            <div class="stat-value" id="d2-wr">--</div>
-            <div class="stat-sub" id="d2-trades"></div>
+            <div class="stat-value" id="arb-wr">--</div>
+            <div class="stat-sub" id="arb-trades"></div>
           </div>
           <div class="stat-item">
             <div class="stat-label">Open</div>
-            <div class="stat-value" id="d2-open">--</div>
+            <div class="stat-value" id="arb-open">--</div>
           </div>
         </div>
         <div class="divider"></div>
         <div class="last-trade">
           <span class="last-trade-label">Last trade</span>
-          <span class="last-trade-val" id="d2-last">—</span>
+          <span class="last-trade-val" id="arb-last">—</span>
         </div>
       </div>
       <div class="card-footer">
-        <button class="btn" onclick="viewLog('d2')">View Log</button>
-        <button class="btn btn-danger" id="d2-ctrl-btn" onclick="toggleBot('d2')">Stop</button>
+        <button class="btn" onclick="viewLog('arb')">View Log</button>
+        <button class="btn btn-danger" id="arb-ctrl-btn" onclick="toggleBot('arb')">Stop</button>
       </div>
     </div>
 
@@ -1028,7 +1123,7 @@ HTML = r"""<!DOCTYPE html>
       <div style="display:flex;gap:8px;align-items:center;">
         <div class="chart-tabs" id="bot-tabs">
           <div class="chart-tab active" onclick="setChartBot('all',this)">Combined</div>
-          <div class="chart-tab" onclick="setChartBot('d2',this)">D2</div>
+          <div class="chart-tab" onclick="setChartBot('arb',this)">ARB</div>
           <div class="chart-tab" onclick="setChartBot('w',this)">Whale</div>
         </div>
         <div style="width:1px;height:18px;background:var(--line1);"></div>
@@ -1066,6 +1161,20 @@ HTML = r"""<!DOCTYPE html>
         </thead>
         <tbody id="open-tbody"><tr><td colspan="6"><div class="empty-state">No open positions</div></td></tr></tbody>
       </table>
+    </div>
+  </div>
+
+  <!-- ── ARB Signal Feed ── -->
+  <div class="feed-section">
+    <div class="feed-header">
+      <div style="font-weight:600;font-size:13px;">ARB Signal Feed <span id="feed-dot" style="display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--green);margin-left:6px;vertical-align:middle;"></span></div>
+      <div style="font-size:11px;color:var(--muted);">Live · updates every 3s</div>
+    </div>
+    <div class="feed-head">
+      <span>Time</span><span>Asset</span><span>Market</span><span>Type</span><span>Dir</span><span>Drift</span><span>Ask</span><span>EV / Reason</span>
+    </div>
+    <div class="feed-body" id="feed-body">
+      <div style="padding:20px;text-align:center;color:var(--muted);font-size:12px;">Waiting for signals…</div>
     </div>
   </div>
 
@@ -1110,7 +1219,7 @@ HTML = r"""<!DOCTYPE html>
 
 <script>
 // ── State ──────────────────────────────────────────────────────────────────
-const botRunning = { d2: false, w: false };
+const botRunning = { arb: false, w: false };
 let chartBot   = 'all';
 let chartHours = 0;
 let balChart   = null;
@@ -1160,7 +1269,7 @@ async function loadStatus() {
     const r   = await fetch('/api/status');
     const data = await r.json();
     const br   = data.bankroll;
-    const d2   = data.bots.d2;
+    const arb  = data.bots.arb;
     const w    = data.bots.w;
 
     // Hero — balances
@@ -1182,7 +1291,7 @@ async function loadStatus() {
     const depEl = document.getElementById('h-deployed');
     depEl.textContent = fmtUSD(bal.deployed);
 
-    const totalOpen = d2.open + w.open;
+    const totalOpen = arb.open + w.open;
     setEl('h-open-count', totalOpen + ' open position' + (totalOpen !== 1 ? 's' : ''));
 
     const pnlEl = document.getElementById('h-pnl');
@@ -1194,16 +1303,16 @@ async function loadStatus() {
     const pct = bal.initial > 0 ? (totalGain / bal.initial * 100) : 0;
     setEl('h-pnl-pct', fmtPct(pct) + ' since inception');
 
-    const totalTrades = d2.total_closed + w.total_closed;
-    const totalWins   = d2.wins + w.wins;
+    const totalTrades = arb.total_closed + w.total_closed;
+    const totalWins   = arb.wins + w.wins;
     const wr = totalTrades > 0 ? (totalWins / totalTrades * 100) : 0;
     const wrEl = document.getElementById('h-wr');
     wrEl.textContent = wr.toFixed(1) + '%';
     colorClass(wr >= 52 ? 1 : -1, wrEl);
     setEl('h-trades', totalTrades + ' settled trades');
 
-    // D2 card
-    updateBotCard('d2', d2);
+    // ARB card
+    updateBotCard('arb', arb);
     // W card
     updateBotCard('w', w);
     if (w.whale_pool_size !== undefined)
@@ -1485,6 +1594,66 @@ loadChart(chartBot);
 
 setInterval(refreshAll, 15000);
 setInterval(() => loadChart(chartBot, chartHours), 60000);
+
+// ── ARB Signal Feed ──────────────────────────────────────────────────────────
+let feedLastTs = null;
+
+async function loadFeed() {
+  try {
+    const r = await fetch('/api/arb/feed?n=100');
+    const d = await r.json();
+    const sigs = d.signals || [];
+    const body = document.getElementById('feed-body');
+    if (!sigs.length) { body.innerHTML = '<div style="padding:20px;text-align:center;color:var(--muted);font-size:12px;">Waiting for signals…</div>'; return; }
+
+    const newest = sigs[sigs.length - 1]?.ts;
+    if (newest === feedLastTs) return;
+    feedLastTs = newest;
+
+    const rows = [...sigs].reverse().map(s => {
+      const time = s.ts ? s.ts.split(' ')[1] : '';
+      let typeTag, dirHtml, driftHtml, askHtml, evHtml;
+
+      if (s.type === 'enter') {
+        typeTag   = '<span class="tag-enter">ENTER</span>';
+        const dc  = s.dir === 'Up' ? 'dir-up' : 'dir-down';
+        dirHtml   = `<span class="${dc}">${s.dir}</span>`;
+        const dv  = parseFloat(s.drift);
+        driftHtml = `<span class="${dv >= 0 ? 'dir-up' : 'dir-down'}">${dv >= 0 ? '+' : ''}${s.drift}%</span>`;
+        askHtml   = s.ask || '—';
+        evHtml    = `<strong>${s.ev}</strong>`;
+      } else if (s.type === 'skip') {
+        typeTag   = '<span class="tag-skip">SKIP</span>';
+        dirHtml   = '—'; driftHtml = '—'; askHtml = '—';
+        evHtml    = `<span style="color:var(--muted)">${s.reason}</span>`;
+      } else {
+        // tick — classify pass/fail visually
+        const dv   = parseFloat(s.drift);
+        const ev   = parseFloat(s.ev);
+        const pass = Math.abs(dv) >= 0.05 && ev >= 0.10;
+        typeTag    = pass
+          ? '<span style="color:var(--green);font-size:10px;">●</span>'
+          : '<span style="color:var(--muted);font-size:10px;">○</span>';
+        const dc   = s.dir === 'Up' ? 'dir-up' : s.dir === 'Down' ? 'dir-down' : '';
+        dirHtml    = s.dir ? `<span class="${dc}">${s.dir}</span>` : '—';
+        driftHtml  = isNaN(dv) ? '—' : `<span class="${dv >= 0 ? 'dir-up' : 'dir-down'}">${dv >= 0 ? '+' : ''}${s.drift}%</span>`;
+        askHtml    = (s.ask && s.ask !== 'None') ? s.ask : '—';
+        evHtml     = (s.ev && s.ev !== 'None') ? s.ev : '—';
+      }
+
+      return `<div class="feed-row ${s.type}">
+        <span>${time}</span><span>${s.asset}</span><span>${s.market}</span>
+        <span>${typeTag}</span><span>${dirHtml}</span><span>${driftHtml}</span>
+        <span>${askHtml}</span><span>${evHtml}</span>
+      </div>`;
+    }).join('');
+
+    body.innerHTML = rows;
+  } catch(e) { console.error('feed error', e); }
+}
+
+loadFeed();
+setInterval(loadFeed, 3000);
 </script>
 </body>
 </html>"""

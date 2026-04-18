@@ -85,6 +85,60 @@ D2 trades: **BTC, DOGE, XRP** (SOL and ETH removed — poor WR). 5-min and 15-mi
 **D4 paused 2026-04-08:** 34% WR, -$232.
 **D2 start/stop:** controlled via dashboard (`POST /api/bot/d2/start` or `stop`). Flag `/root/d2_paused` prevents watchdog revival when stopped.
 
+### ARB Bot — Pre-Expiry Drift Arb (planned 2026-04-17)
+
+**Strategy:** At T=-35s before each 5-min market expiry, check if Coinbase spot has drifted >0.05% from the window reference price. Buy the winning token on the CLOB if it's still mispriced (ask < 0.85). Empirical basis from probe: 22/23 = 96% win rate when |drift| > 0.05% across 35 observations (6 batches, all 5 assets).
+
+| Bot | Dir | Log Path | Status |
+|-----|-----|----------|--------|
+| ARB | `/root/kalshiedge_arb/` | `logs_arb/bot.log` | **RUNNING LIVE** — replaces D2 |
+
+**Entry logic:**
+1. Rescan every 30s for all 5-asset 5-min markets expiring in 10–600s
+2. For each market: fetch `ref_price` = Coinbase 1-min candle OPEN at `end_time - 300` (minute-aligned)
+3. At T=-35s: poll Coinbase price every 1s until T=-6s
+4. Each second: `drift = (curr - ref) / ref`
+   - If `|drift| < MIN_DRIFT_PCT (0.05%)`: skip (coin flip zone — 50% WR below threshold)
+   - Determine winner direction (UP if curr > ref, DOWN otherwise)
+   - Fetch winner token best ask from CLOB via Frankfurt proxy
+   - If `winner_ask ≥ MAX_WINNER_ASK (0.85)`: CLOB already priced in → skip
+   - If `0.99 - winner_ask > MIN_EV (0.10)`: **ENTER** (one trade per market)
+5. Stop at T=-6s — market makers reprice at T=-5s, window closes
+
+**Key parameters (env-overridable):**
+```
+MIN_DRIFT_PCT      = 0.0005   # 0.05% — below this is coin flip
+MAX_WINNER_ASK     = 0.85     # above this CLOB has already priced direction
+MIN_EV             = 0.10     # minimum 0.99 - ask
+ENTRY_START_SECS   = 35       # seconds before expiry to start watching
+ENTRY_STOP_SECS    = 3        # seconds before expiry to stop (was 6; tightened 2026-04-18)
+ASSETS             = BTC,ETH,SOL,DOGE,XRP
+MAX_KELLY_FRACTION = 0.20
+MAX_OPEN_POSITIONS = 10
+MIN_ASK_PRICE      = 0.01     # lowered from 0.05 — captures highest-EV signals (ask=0.02-0.03)
+DISABLE_LONGSHOT_FLIP = 1     # poly_executor longshot flip disabled — wrong for ARB (flips direction)
+MIN_MARKET_SECS_LEFT  = 5     # reads from env; was hardcoded 28 in poly_executor
+PAPER_TRADING      = 0        # LIVE as of 2026-04-18
+```
+
+**Files built:**
+- `arb_main.py` — main loop with Telegram alerts (startup/shutdown/entry/settlement)
+- `.env`
+
+**Files copied from D2:**
+- `market_finder.py`, `poly_executor.py`, `drift_ev.py`, `coinbase_ws.py`, `telegram_alerts.py`
+
+**D2 disposition:** Paused via `/root/d2_paused` flag, not deleted. ARB takes its watchdog slot.
+
+**Probe findings (2026-04-17, 6 batches):**
+- Overall drift signal accuracy: 28/35 = 80%
+- With |drift| > 0.05% filter: 22/23 = 96%
+- All 7 errors had |drift| < 0.05% — confirmed coin flip zone
+- Best case: DOGE 02:05 UTC — drift +0.101%, CLOB selling UP at 2¢ (EV=0.97), resolved UP → 49x return in 35s
+- Entry window: T=-35s to T=-6s (29 seconds); CLOB reprices simultaneously across all assets at T≈-5s
+
+---
+
 ### Whalebot (W) — built 2026-04-08, deployed 2026-04-08
 
 | Bot | Dir | Pool | Log Path | Status |
@@ -401,6 +455,8 @@ TELEGRAM_CHAT_ID=6400219232
 **NOTE:** ml_filter_dataset.py trade filtering fixed 2026-04-10 (eighth session) — original filter matched condition_ids against token_ids (never matched, 0 results). Fixed to extract token IDs from `clob_token_ids` column, filter trades by token ID, compute ask_price from earliest trade per market (block_number+log_index sort, timestamp=null), join ask_price back to markets_updown.parquet. Resume logic pre-filters args_list in main process (skips files with existing chunks). ~27.9M matching rows from high-trade-ID files (100M+ range). Low-ID files (<100M) are pre-crypto-market trades with 0 matches.
 **NOTE:** d_main.py + w_main.py ML gate integrated 2026-04-10 (eighth session) — `ml_predict.py` wired into both bots. Gate after EV pass, before execute. No model = passthrough (kelly_scale=1.0, always trades). Model loaded = p_win gate + kelly scaling. Local files: `C:\tmp\d_main_latest.py`, `C:\tmp\w_main.py`. Deployed 2026-04-11 (ninth session).
 **NOTE:** ML model v5 trained and deployed 2026-04-11 (ninth session) — CV AUC 0.774 (up from 0.615 with wrong timestamps). Key fixes: (1) features computed at `window_start_ts = end_ts - duration_secs` (resolution window start, not market creation time); (2) added bn_momentum_15m/30m/60m, realized_vol_30m, price_vs_ma20/ma60; (3) symbol×direction combo features; (4) dropped zero-filled columns (s9_premium, s10_basis, bn_cvd_1m); (5) parallel backfill with 8 workers (9.6 min vs 35 min). Holdout WR (last 30 days): 90.9% at p≥0.70. Temporal stability: first half 89.4% WR, second half 86.0% WR. Deployed threshold: p≥0.70. Model at `/root/shared_ml/`.
+**NOTE:** ML model versions (2026-04-16, seventeenth session) — v5: AUC 0.7739, 95K rows, threshold 0.70 (currently deployed). v6: AUC 0.546 (broken timestamps, discarded). v7: AUC 0.7053, 466K rows, threshold 0.65. v8: AUC 0.7056, 466K rows + OI/DVOL/CVD15m/30m features. v9: Optuna-tuned (100 trials in progress), expected AUC 0.71+. Model files at C:/tmp/ml_data/model_v{5,7,8,9}/. Scripts: ml_backfill.py, ml_train.py, ml_tune.py, ml_ensemble.py, ml_walkforward.py, ml_prefetch.py.
+**NOTE:** Walk-forward validation (ml_walkforward.py, 2026-04-16) — 6-fold expanding window on v8 training data. OOS AUC 0.678 (vs 0.706 CV — realistic live estimate). OOS WR @ p≥0.65: 72.1% on 66,705 trades. Consistent 70-74% WR across all 6 folds (Sep 2025 → Apr 2026).
 **NOTE:** ML retraining cron ml_calibrate.py (ninth session) — reads settled trades from D2+W positions.jsonl, extracts features from signals.jsonl, combines with historical data (rolling 90-day window), retrains XGBoost every 30 min. Cron: `*/30 * * * * python3 /root/ml_calibrate.py >> /tmp/ml_calibrate.log 2>&1`. Rolling window prevents stale regime data diluting model.
 **NOTE:** ML Kelly stacking with whale signal (ninth session, coworker recommendation) — when both ML p≥0.70 AND whale consensus fire → max Kelly (1.5×). ML alone (D2, no whale) → full Kelly. W-bot: whale+ML → full Kelly, whale alone → normal Kelly (no ML scaling), ML veto → skip. Deploy threshold p≥0.70 (holdout WR 83.4% on full holdout, 90.9% on last 30 days). Monitor live WR on first 200 trades; if holds 80%+, Kelly fully open.
 **NOTE:** S11 CVD signal added (tenth session) — `s11_cvd()` in direction_signals.py. Binance aggTrades via Frankfurt proxy (138.197.181.139:8081), 5-min window, net buy fraction threshold 0.08. Returns UP/DOWN/NEUTRAL, conf 0.55-0.75. Runs in parallel with S1-S6 in direction_consensus.py. Weight=1.0 in SIGNAL_WEIGHTS. TTL=60s. Also deployed direction_signals.py + direction_consensus.py to whalebot dir.
@@ -416,6 +472,11 @@ TELEGRAM_CHAT_ID=6400219232
 **NOTE:** Tax record system deployed (sixteenth session) — `tax_record_update.py` reads both positions.jsonl files, filters status=won AND paper=false, appends new wins to `/root/tax_record.csv`. Fields: trade_id, bot, date_opened_utc, date_closed_utc, asset, direction, entry_price, exit_price, contracts, cost_usd, gross_payout_usd, net_profit_usd, tx_hash. Cron: every 30 min.
 **NOTE:** Tax reserve system deployed (sixteenth session) — `tax_reserve_update.py` computes marginal tax after each win and accumulates in `/root/tax_reserve.json`. Bracket table based on $6K base income, $15K standard deduction ($9K free zone): $0–9K=5%, $9K–20.9K=13%, $20.9K–57.5K=15%, $57.5K–112.4K=25%, $112.4K–206.3K=28%, $206.3K+=35%. Kelly sizing in poly_executor.py uses `bankroll - tax_reserve_usd` as effective bankroll so reserved funds are never wagered. Cron: every 30 min.
 **NOTE:** Chop classifier deployed (sixteenth session) — `chop_classifier.py` in both D2 and W dirs. Fetches Coinbase 1-min candles (CHOP_CANDLES=20), computes three metrics: (1) range efficiency = |net move| / sum(candle ranges) — low = chop; (2) lag-1 return autocorrelation — negative = mean-reverting = chop; (3) directional fraction — 50/50 split = chop. Weighted score [0,1]: chop_score = 0.40×eff_chop + 0.35×corr_chop + 0.25×dir_chop. is_chop = score >= CHOP_THRESHOLD (default 0.55). Cache TTL=60s. In D2: applied only in Ranging regime — CHOP_KELLY_MULT=0.6 applied, plus center guard (skip ask 0.44–0.56). In W: applied regardless of regime (no regime detector in W). Env vars: CHOP_THRESHOLD, CHOP_CANDLES, CHOP_TTL, CHOP_KELLY_MULT, CHOP_EDGE_LO=0.44, CHOP_EDGE_HI=0.56.
+**NOTE:** ARB bot built and deployed LIVE 2026-04-18 (eighteenth session) — `arb_main.py` at `/root/kalshiedge_arb/`. Telegram alerts: startup, shutdown (SIGTERM/SIGINT), entry (drift/ask/ev/size/time), settlement (won/lost with session W/L/PnL). 3 live trades won: XRP Down +$4.17, XRP Down +$3.46, DOGE Up +$6.00. Starting bankroll $112.15. Dashboard replaced D2 with ARB.
+**NOTE:** ARB poly_executor fixes 2026-04-18 — (1) `DISABLE_LONGSHOT_FLIP=1`: longshot flip gated by env var; ARB already knows direction from drift, flip to opposite direction is wrong. (2) `MIN_MARKET_SECS_LEFT` now reads from env (was hardcoded 28); ARB .env sets 5 — allows entry at T=-5s to T=-35s. (3) `ENTRY_STOP_SECS=3` (was 6) — captures 3 more seconds of window. (4) `MIN_ASK_PRICE=0.01` (was 0.05) — captures highest-EV signals where CLOB still selling winner at 2-3¢ (EV=0.97).
+**NOTE:** ARB settlement REDEEM bug fixed 2026-04-18 — `_get_confirmed_settlement_data()` in poly_executor.py filtered by `asset == token_id` but REDEEM events have `asset: ""`. Fixed by matching REDEEMs via `conditionId == pos.condition_id` instead. Same root cause as dashboard reconcile fix. Settlement loop was spinning indefinitely on every won trade.
+**NOTE:** Dashboard signal feed panel added 2026-04-18 — `/api/arb/feed` endpoint parses ARB bot.log for tick/ENTER/skip lines. JS polls every 3s, renders scrolling table. Green dot (●) = tick passed drift+EV thresholds; grey dot (○) = didn't pass; ENTER = trade placed; SKIP = poly_executor gate blocked. Shows ALL market observations, not just entries.
+**NOTE:** Dashboard open positions count bug fixed 2026-04-18 — `_bot_stats()` was counting every `event=="open"` record without decrementing on close events. Fixed to track by id (same dict-pop pattern as `api_open_positions`), with `end_time > now` filter.
 **NOTE:** Profit lock loop deployed (sixteenth session) — `profit_lock_loop(executor)` added to both d_main.py and w_main.py asyncio.gather. Checks every PROFIT_LOCK_INTERVAL=10s. For each open position: if secs_left < PROFIT_LOCK_SECS (90s) AND (bid - entry_price) / entry_price >= PROFIT_LOCK_PCT (0.70) → closes immediately. New methods added to poly_executor.py: `_get_best_bid(token_id)` (fetches best bid from CLOB book), `_execute_live_sell(token_id, contracts, min_price)` (SELL FOK via proxy), `close_position(pos, reason, bid_price)` (paper or live close, writes close event, credits bankroll). All thresholds env-overridable.
 
 ---
@@ -700,7 +761,15 @@ nohup python3 d_main.py >> logs_d3/bot.log 2>&1 &
 | Dashboard balance chart accuracy fix (close-events only, bankroll.json initial, LA timezone) | DONE 2026-04-11 (eleventh session) |
 | Dashboard three-way balance: Total/Liquid/Deployed | DONE 2026-04-11 (eleventh session) |
 | ML backfill expanded to 164,094 markets → training_data.jsonl | DONE 2026-04-11 (eleventh session) |
-| Train model v6 on 164K-market dataset | pending |
+| Train model v6 on 164K-market dataset | DONE 2026-04-16 (seventeenth session) — CV AUC 0.705 on 244K rows |
+| ML pipeline v7/v8: new features (CVD 15m/30m, Binance OI 30-day via Frankfurt SSH, Deribit DVOL), 466K markets | DONE 2026-04-16 (seventeenth session) |
+| v8 backfill (gamma_backfilled_v8.jsonl, 371K rows, 13 min) + v8_training.jsonl combined (466K rows) | DONE 2026-04-16 |
+| v8 model trained: unified AUC 0.7056, per-asset BTC 0.7115 / ETH 0.7185 / DOGE 0.7206 / XRP 0.7261 / SOL 0.6966 / BNB 0.7191 | DONE 2026-04-16 |
+| Walk-forward validation (ml_walkforward.py, 6 folds): OOS AUC 0.678, OOS WR 72.1% on 66K trades | DONE 2026-04-16 |
+| Optuna hyperparameter tuning (ml_tune.py, 100 trials, holdout+early-stop on full 466K dataset) → model_v9 | DONE 2026-04-18 — 100 trials complete, AUC 0.717, deployed to /root/shared_ml/ |
+| Ensemble training (ml_ensemble.py, XGBoost + LightGBM + CatBoost soft-voting) | pending — after Optuna |
+| Deploy v9 (Optuna-tuned) + ensemble to VPS /root/shared_ml/ | pending |
+| Per-duration models (5-min vs 15-min per-asset split, +0.005-0.015 AUC) | pending — after ensemble |
 | Monitor 50-100 trades post-combo-cleanup — confirm W:L moves toward 1.3×+ | CURRENT |
 | Go live (PAPER_TRADING=0, D2 + W .env restart) | DONE 2026-04-12 |
 | Codex session: fix invalid signature, deploy ChoppinessGate/QualityModel/KronosSignal, live trades working | DONE 2026-04-13–14 |
@@ -718,6 +787,13 @@ nohup python3 d_main.py >> logs_d3/bot.log 2>&1 &
 | Chop classifier (chop_classifier.py, range efficiency + autocorr + dir_frac, 0.6× Kelly + center guard in chop) | DONE 2026-04-16 |
 | Profit lock loop (sell FOK if gain ≥70% and <90s to expiry, close_position() in poly_executor) | DONE 2026-04-16 |
 | Maker order infrastructure (LimitOrderArgs, cancel loop, fill polling, chop-mode mean-reversion entry) | next |
+| ML seventeenth session: v7/v8 backfill+training, walk-forward validation, Optuna tuner, ensemble builder | DONE 2026-04-16 |
+| ARB bot built + deployed LIVE (arb_main.py, Telegram alerts, poly_executor fixes) | DONE 2026-04-18 |
+| ARB poly_executor: disable longshot flip, MIN_MARKET_SECS_LEFT from env, ENTRY_STOP_SECS=3, MIN_ASK_PRICE=0.01 | DONE 2026-04-18 |
+| ARB settlement REDEEM fix: match by conditionId for REDEEM events (asset="" bug) | DONE 2026-04-18 |
+| Dashboard: ARB signal feed panel (/api/arb/feed, live tick/ENTER/SKIP, 3s poll) | DONE 2026-04-18 |
+| Dashboard: open positions count bug fixed (_bot_stats now tracks by id, not raw event count) | DONE 2026-04-18 |
+| Apply ARB settlement REDEEM fix to W-bot poly_executor.py | pending |
 
 Spec files: `/root/polybot_backup/spec_d1_d6_consensus_system.md`, `spec_directional_wallet_scanner.md`
 Whalebot spec: `C:\Users\gabri\docs\superpowers\specs\2026-04-07-whalebot-design.md`
