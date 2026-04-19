@@ -55,6 +55,7 @@ def _arb_conf(ask: float) -> float:
     if ask >= 0.75: return ARB_CONF_HI
     if ask >= 0.65: return ARB_CONF_MID
     return ARB_CONF_LO
+
 BANKROLL_USD      = float(os.getenv('BANKROLL_USD', '107'))
 PAPER_TRADING     = os.getenv('PAPER_TRADING', '1') != '0'
 POLY_PRIVATE_KEY  = os.getenv('POLYMARKET_PRIVATE_KEY', '')
@@ -63,7 +64,7 @@ os.makedirs(LOGS_DIR, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s %(message)s',
-    handlers=[logging.FileHandler(LOG_PATH, mode='a'), logging.StreamHandler()]
+    handlers=[logging.FileHandler(LOG_PATH, mode='a')]
 )
 log = logging.getLogger('arb')
 
@@ -271,7 +272,6 @@ async def arb_one(mkt: dict, executor: PolyExecutor,
             await asyncio.sleep(1.0)
             continue
 
-        # Drift passed — check remaining thresholds and log first miss per reason
         if win_ask is None or win_ask >= MAX_WINNER_ASK:
             reason = 'ask_too_high'
             if reason not in logged_skips:
@@ -315,7 +315,7 @@ async def arb_one(mkt: dict, executor: PolyExecutor,
             exec_mkt, direction, conf,
             source='arb', ask_price=win_ask,
         )
-        entered = True  # one trade per market regardless of outcome
+        entered = True
 
         if pos:
             log.info(
@@ -500,7 +500,6 @@ async def main():
                     key = (mkt['asset'], round(mkt['end_time'] / 300) * 300)
                     if key in scheduled:
                         continue
-                    # Need enough runway: at least ENTRY_START_S + 10s still remaining
                     if mkt['secs_left'] < ENTRY_START_S + 10:
                         continue
                     scheduled.add(key)
@@ -511,9 +510,7 @@ async def main():
                         f"({mkt['secs_left']:.0f}s left)"
                     )
 
-                # Expire old scheduled keys (>10 min past end_time)
                 scheduled = {k for k in scheduled if k[1] > now - 600}
-
                 await asyncio.sleep(SCAN_INTERVAL)
 
 

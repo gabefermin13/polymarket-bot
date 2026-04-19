@@ -100,7 +100,7 @@ _LABEL    = f"[{BOT_LABEL}] " if BOT_LABEL else ""
 
 
 
-MAX_KELLY_FRACTION   = 0.20   # quarter-Kelly for safety
+MAX_KELLY_FRACTION   = float(os.getenv("MAX_KELLY_FRACTION", "0.20"))
 
 
 
