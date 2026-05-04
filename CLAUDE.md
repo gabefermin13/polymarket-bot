@@ -1,3 +1,55 @@
+## Coordination Layer — Claude / Codex Handoff
+
+Claude and Codex share state through three artifacts. **Always read these first; always update them at the end of any session.**
+
+1. **Shared session handoff:** `C:\tmp\session_state.md`
+   - Read it at session start (`/handoff-start`).
+   - Update it at session end (`/handoff-end`).
+   - Never edit it while the other agent owns it.
+2. **Decision gates:** `C:\tmp\decision_gates\*.md` (index at `index.md`)
+   - Active gate: `2026-04-20_migration-gate_polymarket-v2.md` (V2 migration, deadline 2026-04-28 11:00 UTC).
+   - All high-stakes changes (migration steps, sizing, new strategies, postmortems) must go through a gate before execution.
+3. **Git history** on `C:\tmp` (remote: `SierraNevadapng/polymarket-bot`, private). **This project copy of `.claude/` and `CLAUDE.md` is authoritative**; the user-level copy under `C:\Users\gabri\.claude\` is a convenience fallback only. If they diverge, this copy wins.
+
+### Slash commands (`.claude/commands/`)
+
+| Command | Purpose |
+|---|---|
+| `/handoff-start` | Read `session_state.md` and orient. Read-only. |
+| `/handoff-end` | Update `session_state.md` with what changed and the next action. |
+| `/v2-gate` | Audit / progress the Polymarket V2 migration gate. |
+| `/safeoff-check` | Verify all bots are paused and idle before any risky step. |
+| `/strategy-gate` | Open or review a strategy / sizing decision gate. |
+| `/weather-review` | Market-conditions report (regime, vol, liquidity, recent WR). |
+| `/postmortem` | Write a blameless postmortem for a drawdown / incident. |
+
+### Subagents (`.claude/agents/`)
+
+| Agent | Use for |
+|---|---|
+| `polymarket-v2-gate` | Claim-by-claim audit of the V2 migration gate. |
+| `deploy-smoke-and-safeoff` | Read-only deploy smoke + safe-off verification. |
+| `strategy-suite-gate` | Evaluate proposed strategy / sizing changes through a gate. |
+| `weather-research-runner` | Produce the weather report. |
+| `trading-postmortem-writer` | Pull evidence and write a postmortem document. |
+
+### Hard rails (apply to every command and agent above)
+
+These are forbidden unless the user has **explicitly authorized** the specific action **and** the relevant gate is in a state that permits it:
+
+- Placing live orders or running signed-order smoke
+- Unpausing any bot (C-bots, D2, W, ARB)
+- Removing any pause flag — the full set is whatever the current runtime / source-map / session state lists as expected pause flags (do not hardcode the count or list)
+- Creating `/root/arb_v2_ready`
+- Editing runtime trading files: `arb_main.py`, `arb_poly_executor.py`, `poly_executor.py`, `dashboard.py`, any `.env`
+- Printing private keys, full API tokens, mnemonics, or password values
+- Writing to `session_state.md` outside of `/handoff-end`
+- Writing to a decision gate while the other agent owns it (per `session_state.md`)
+
+If a request appears to require any of the above, stop and ask. Authorization stands only for the specific scope named.
+
+---
+
 ## Strict Operating Rules — Follow Without Exception
 
 ### Scope
@@ -50,7 +102,7 @@ A whale copy-trading + directional signal system for Polymarket Up-or-Down marke
 **Core insight:** Certain Polymarket wallets win 80-100% of their Up-or-Down trades over hundreds of markets. By monitoring their on-chain Polygon activity in real time and requiring N whales to agree (consensus filter), we copy only their highest-conviction signals.
 
 **Current mode:** LIVE — real orders on Polymarket CLOB. Gone live 2026-04-12. Shared bankroll at `/root/shared_bankroll.json`. Starting bankroll $97.28; balance as of go-live: $279.20.
-**Current balance (2026-04-15):** ~$45.13 (verified on-chain). Both D2 and W running LIVE. D2: PASS2_N_REQUIRED=0.5, ML as primary gate. W: QM_PRIOR_ALPHA=10, quality_model.json cleared.
+**Current V2 state (2026-05-03):** Gate remains `blocked`. ARB is paused: `/root/arb_paused` present, `/root/arb_v2_ready` absent, `arb_main` not running, dashboard ARB start returns `409 Conflict`, and `get_open_orders()` returns list length `0`. Collateral account mismatch is reconciled after the ARB resolver patch: runtime funder resolves to `0xEf5750e0787C23e7540110ca54D1e098bdC4C9DF`, raw pUSD balance is `50668374` (`50.668374` pUSD), raw allowances/CTF approvals are ready, and CLOB `/balance-allowance` matches. Signed submit/cancel smoke has not been authorized or run; stop and ask before any signed smoke, unpause, ready flag creation, or pause flag removal.
 
 ---
 
@@ -377,6 +429,7 @@ TELEGRAM_CHAT_ID=6400219232
 **NOTE:** W QM_PRIOR_ALPHA raised to 10 (2026-04-15, fifteenth session) — root cause of `below_min_dollars`: stale quality_model.json (pre-populated by Codex with quality=0.416 for many wallets, all n=0). Combined Kelly chain: base×0.60(EV)×0.50(ML)×0.416(QM)×1.30(tier) = 0.92/ask < $1.00. Fix: `QM_PRIOR_ALPHA=10` in W .env → prior_quality=10/11.5=0.870. Also cleared quality_model.json to `{}` so all wallets start fresh from new prior (old JSON had junk pre-populated scores not from live trades). Combined chain now produces $2.30+ positions.
 **NOTE:** D2 PASS2_N_REQUIRED lowered 1.0→0.5 (2026-04-15, fifteenth session) — root cause of D2 undertrading (5 executions from 656 evaluated signals): S3/S4/S5/S7 all return NEUTRAL/NONE/FLAT in ranging markets, leaving only S2 (contrarian, weight=-0.5) and S11 (weight=1.0). IC-weighted pass-2 score = 1.0−0.5 = 0.5 < PASS2_N_REQUIRED=1.0 → 410/656 signals blocked by `below_threshold_after_s6`. Fix: `PASS2_N_REQUIRED=0.5` in D2 .env. ML gate is now primary quality filter. Pass-1 still requires 2 raw signals to agree on direction.
 **NOTE:** Actual maker address is `0xEf5750e0787C23e7540110ca54D1e098bdC4C9DF` — this is `builder.funder` as resolved by `_resolve_proxy_funder()` (eth_call `getPolyProxyWalletAddress(EOA)` on CTF Exchange). Polymarket activity API indexes trades under this address, NOT under `POLYMARKET_ADDRESS` (`0xaeA2bb57...`). `_live_owner()` correctly returns `builder.funder` when client is initialized.
+**NOTE:** ARB V2 proxy resolver patch 2026-05-03 — V2 exchange `0xE111180000d2663C0091e4f400237545B87B996B` reverts on `getPolyProxyWalletAddress(address)`, so ARB `poly_executor.py` now resolves the proxy wallet through old helper/CTF exchange `0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E` while still using V2 exchange for orders. Resolver fails closed: no silent fallback to `POLYMARKET_ADDRESS`; live init requires pUSD balance, pUSD allowances, and CTF approvals for exchange_v2, neg-risk adapter, and neg-risk exchange_v2. Non-order readiness reconciled for maker `0xEf5750...`; signed submit/cancel smoke still not run.
 **NOTE:** iProyal proxy `_lifetime-30m` removed 2026-04-13 — session rotation parameter was killing in-flight order submissions (~20s timeout, `status_code=None`). Removed from `CLOB_PROXY_URL` in both D2 and W `.env`. Verified: HTTP 200 in 1.23s after fix.
 **NOTE:** iProyal removed entirely 2026-04-15 (fifteenth session) — going direct from NYC VPS revealed geo-block: `HTTP 403 Trading restricted in your region`. Root cause of all prior missed fills: iProyal was the only thing preventing geo-block; when it dropped connections mid-flight (proxy timeout shorter than CLOB response), orders filled on-chain but bot had no connection to receive result. Fix: deployed HTTP CONNECT proxy (`clob_proxy.py`) on Frankfurt droplet (138.197.181.139:8083) as systemd service `clob-proxy`. Frankfurt (EU) is not geo-blocked. `CLOB_PROXY_URL=http://138.197.181.139:8083` set in both D2 and W `.env`. Verified: `curl -x http://138.197.181.139:8083 https://clob.polymarket.com/markets` returns HTTP 200.
 **NOTE:** `invalid signature` root cause identified 2026-04-13 (thirteenth session) — after proxy fix, all orders return `status_code=400, {'error': 'invalid signature'}`. Ruled out: (1) neg_risk/wrong exchange — confirmed `neg_risk=False`, `py_clob_client` selects correct verifyingContract `0x4bFb41d5...` via `get_neg_risk(token_id)` at runtime. (2) EIP-712 domain construction — correct. Most likely cause: EOA (`0xcECEEb57accF34ED2e21D25d6C2037F6109751f0`) not registered as approved operator for proxy wallet (`0xaeA2bb57baF02E5148C478a7d7D5dBF851ceA7Ae`) on CTF Exchange contract on Polygon. Check via `isRegisteredOperator(proxy_wallet, EOA)` on `0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E`. NOTE: earlier "orderbook does not exist" test did NOT prove signature validity — Polymarket checks orderbook existence before signature validation. Handed off to Codex/ChatGPT for resolution.
