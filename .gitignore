@@ -1,0 +1,6 @@
+# Never commit env files - they contain real API keys, private keys, and tokens
+.env
+*.env
+**/.env
+**/.env.*
+arb_env
